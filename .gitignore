@@ -1,0 +1,36 @@
+# Исполняемые файлы и сборка PyInstaller
+dist/
+build/
+*.spec
+DuoPy.exe
+DuoPy_v2.exe
+
+# Временное окружение сборки и тестов
+.build_backup/
+.run_tmp/
+.upd_test/
+.test_tmp/
+.probe_tmp/
+_build_tmp/
+
+# Байткод Python и кэш
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Виртуальные окружения
+.venv/
+venv/
+ENV/
+env/
+
+# IDE и редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Пользовательские конфиги и логи
+*.log
+.duopy_cache/
