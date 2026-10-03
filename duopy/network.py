@@ -1,0 +1,712 @@
+"""
+Сетевой стек DuoPy с поддержкой глобального онлайн-подключения через интернет:
+1. Режим онлайн-комнат по коду (Cloud Relay): работает между любыми странами и сетями без белых IP и без настройки роутеров.
+2. Режим прямого TCP подключения (Local IP / LAN): для локальных сетей и оффлайн-работы.
+"""
+
+import socket
+import struct
+import json
+import threading
+import time
+import random
+from datetime import datetime
+from PyQt6.QtCore import QObject, pyqtSignal
+
+try:
+    import paho.mqtt.client as mqtt
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+
+# Глобальные брокеры: сначала шифрованный TLS, затем обычный порт как запасной
+# вариант (в некоторых сетях исходящий 8883 закрыт). Формат: (хост, порт, TLS).
+DEFAULT_RELAY_BROKERS = [
+    ("broker.emqx.io", 8883, True),
+    ("broker.hivemq.com", 8883, True),
+    ("broker.emqx.io", 1883, False),
+    ("broker.hivemq.com", 1883, False),
+]
+
+# Максимальный размер одного кадра TCP-протокола (защита от зависания на
+# некорректной или враждебной длине кадра)
+MAX_FRAME_BYTES = 32 * 1024 * 1024
+
+
+def get_local_ip() -> str:
+    """Получение локального IP-адреса в сети."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+def generate_room_code() -> str:
+    """Генерация легко запоминающегося кода комнаты."""
+    digits = random.randint(1000, 9999)
+    return f"DUO-{digits}"
+
+
+class NetworkManager(QObject):
+    """Сетевой менеджер сессии совместного программирования."""
+
+    # Сигналы для UI
+    connected_signal = pyqtSignal(str, str)               # (peer_name, room_or_ip)
+    disconnected_signal = pyqtSignal(str)                # (reason)
+    text_received = pyqtSignal(str)                      # (code_text)
+    file_code_received = pyqtSignal(str, str)            # (code_text, file_name)
+    cursor_received = pyqtSignal(str, str, str, int, int, int, int, int, str) # (uid, name, color, line, col, pos, sel_start, sel_end, file_name)
+    peer_file_changed = pyqtSignal(str, str)             # (peer_name, file_name)
+    run_code_requested = pyqtSignal()
+    stop_code_requested = pyqtSignal()
+    output_received = pyqtSignal(str, bool)              # (text, is_stderr)
+    execution_finished_received = pyqtSignal(int, float) # (return_code, duration)
+    error_highlight_received = pyqtSignal(int, str)      # (line_number, message)
+    chat_received = pyqtSignal(str, str, str)            # (sender, message, time_str)
+    status_signal = pyqtSignal(str)                      # (status_message)
+    profile_updated = pyqtSignal(str, str)               # (peer_name, peer_color)
+    sync_requested_signal = pyqtSignal()                 # Запрос на отправку текущего кода новому участнику
+    stdin_received = pyqtSignal(str)                     # Ввод данных для input() от напарника
+    project_tree_received = pyqtSignal(str, list)        # (project_name, files_list)
+    file_content_requested = pyqtSignal(str)            # (rel_path)
+    file_content_received = pyqtSignal(str, str)        # (rel_path, content)
+    file_create_requested = pyqtSignal(str)             # (rel_path)
+    file_delete_requested = pyqtSignal(str)             # (rel_path)
+    file_save_requested = pyqtSignal(str, str)          # (rel_path, content)
+
+    def __init__(self, username="Разработчик", user_color="#4ec9b0", parent=None):
+        super().__init__(parent)
+        self.username = username
+        self.user_color = user_color
+        self.user_id = f"usr_{int(time.time() * 1000)}_{random.randint(100, 999)}"
+
+        # Режимы сети: "cloud" или "tcp"
+        self.mode: str | None = None
+        self.room_code: str | None = None
+
+        self.is_host = False
+        self.is_connected = False
+        self.running = False
+        self.initial_joined = False
+
+        # TCP ресурсы
+        self.server_socket: socket.socket | None = None
+        self.client_socket: socket.socket | None = None
+        self.peer_socket: socket.socket | None = None
+        self.tcp_thread: threading.Thread | None = None
+        self.send_lock = threading.Lock()
+
+        # Cloud MQTT ресурсы
+        self.mqtt_client: mqtt.Client | None = None
+
+    # =========================================================================
+    # РЕЖИМ 1: ОБЛАЧНЫЕ КОМНАТЫ ЧЕРЕЗ ИНТЕРНЕТ (Между любыми странами и NAT)
+    # =========================================================================
+
+    def start_cloud_room(self, room_code: str | None = None, is_creator: bool = True):
+        """Создание или подключение к глобальной онлайн-комнате."""
+        self.stop()
+        if not HAS_MQTT:
+            self.status_signal.emit("Ошибка: библиотека paho-mqtt не установлена!")
+            return
+
+        self.mode = "cloud"
+        self.is_host = is_creator
+        self.running = True
+        self.room_code = (room_code or generate_room_code()).strip().upper()
+
+        threading.Thread(target=self._cloud_worker, daemon=True).start()
+
+    def _cloud_worker(self):
+        """Подключение к глобальному серверу ретрансляции."""
+        topic = f"duopy/v1/rooms/{self.room_code}"
+        self.status_signal.emit(f"Подключение к серверу комнат... Код: {self.room_code}")
+
+        connected_to_broker = False
+        for host, port, use_tls in DEFAULT_RELAY_BROKERS:
+            client = None
+            try:
+                # Уникальный client_id с энтропией: по одному user_id (метка времени
+                # в миллисекундах) два клиента могли получить одинаковый идентификатор,
+                # и брокер выкидывал одного из них.
+                client = mqtt.Client(
+                    mqtt.CallbackAPIVersion.VERSION2,
+                    client_id=f"duopy_{self.user_id}_{random.randint(1000, 9999)}"
+                )
+                # Раздельные учётные записи: публичные брокеры требуют
+                # аутентификацию, а разные логины не дают клиентам выбивать друг друга.
+                client.username_pw_set(
+                    "duopy_creator" if self.is_host else "duopy_guest",
+                    "duopy2024"
+                )
+                if use_tls:
+                    client.tls_set()
+                self.mqtt_client = client
+                client.reconnect_delay_set(min_delay=1, max_delay=10)
+                client.max_inflight_messages_set(100)
+
+                def on_connect(c, userdata, flags, rc, properties=None):
+                    if rc == 0 or (hasattr(rc, "is_failure") and not rc.is_failure):
+                        c.subscribe(topic, qos=1)
+                        self.is_connected = True
+
+                        is_first = not self.initial_joined
+                        self.initial_joined = True
+
+                        if is_first:
+                            self._cloud_send({
+                                "type": "JOIN",
+                                "sender_id": self.user_id,
+                                "name": self.username,
+                                "color": self.user_color,
+                                "is_creator": self.is_host
+                            })
+                            if self.is_host:
+                                self.status_signal.emit(f"Комната {self.room_code} готова! Напарник может войти по этому коду.")
+                            else:
+                                self.status_signal.emit(f"Вы вошли в комнату {self.room_code}!")
+                                self._cloud_send({
+                                    "type": "REQUEST_SYNC",
+                                    "sender_id": self.user_id
+                                })
+                        else:
+                            # Тихое восстановление связи после секундного перерыва сети
+                            self.status_signal.emit(f"🟢 Связь с комнатой {self.room_code} восстановлена")
+
+                def on_message(c, userdata, msg):
+                    try:
+                        payload = json.loads(msg.payload.decode('utf-8'))
+                        sender = payload.get("sender_id")
+                        if sender == self.user_id:
+                            return
+                        self._dispatch_message(payload)
+                    except Exception as e:
+                        print(f"Ошибка декодирования MQTT: {e}")
+
+                def on_disconnect(c, userdata, flags, rc, properties=None):
+                    self.is_connected = False
+                    if self.running:
+                        self.status_signal.emit(f"🟡 Восстановление связи с комнатой {self.room_code}...")
+
+                client.on_connect = on_connect
+                client.on_message = on_message
+                client.on_disconnect = on_disconnect
+
+                client.connect(host, port, keepalive=60)
+                client.loop_start()
+                connected_to_broker = True
+                # Сообщаем, шифруется ли канал: на публичном брокере без TLS
+                # содержимое комнаты доступно любому подписчику топика.
+                if not use_tls:
+                    self.status_signal.emit(
+                        f"⚠️ Шифрование недоступно, используется незащищённое соединение с {host}"
+                    )
+                break
+            except Exception as e:
+                print(f"Не удалось подключиться к брокеру {host}:{port}: {e}")
+                # Освобождаем сетевые ресурсы неудачной попытки, иначе потоки
+                # и сокеты оставались жить до конца процесса.
+                if client is not None:
+                    try:
+                        client.loop_stop()
+                        client.disconnect()
+                    except Exception:
+                        pass
+                continue
+
+        if not connected_to_broker:
+            self.status_signal.emit("Не удалось соединиться с облачным сервером комнат. Проверьте интернет.")
+            self.running = False
+            self.is_connected = False
+            self.disconnected_signal.emit("Ошибка связи с сервером")
+
+    def _cloud_send(self, data: dict):
+        """Отправка сообщения в топик текущей комнаты."""
+        if not self.mqtt_client or not self.room_code:
+            return True
+        data["sender_id"] = self.user_id
+        topic = f"duopy/v1/rooms/{self.room_code}"
+
+        # Для курсора и потокового текста используем QoS 0,
+        # чтобы избежать переполнения очереди broker'а и ложных разрывов связи
+        msg_type = data.get("type")
+        qos = 0 if msg_type in ("CURSOR_MOVE", "CODE_UPDATE") else 1
+
+        try:
+            raw = json.dumps(data)
+            self.mqtt_client.publish(topic, raw, qos=qos)
+            return True
+        except Exception as e:
+            print(f"Ошибка отправки в MQTT: {e}")
+            return False
+
+    # =========================================================================
+    # РЕЖИМ 2: ПРЯМОЕ TCP ПОДКЛЮЧЕНИЕ (Локальная сеть / LAN / IP)
+    # =========================================================================
+
+    def start_host(self, port: int = 8765):
+        """Запуск локального TCP сервера."""
+        self.stop()
+        self.mode = "tcp"
+        self.is_host = True
+        self.running = True
+
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', port))
+            self.server_socket.listen(1)
+
+            local_ip = get_local_ip()
+            self.status_signal.emit(f"Локальный сервер запущен: {local_ip}:{port}")
+
+            self.tcp_thread = threading.Thread(target=self._tcp_host_worker, daemon=True)
+            self.tcp_thread.start()
+        except Exception as e:
+            self.status_signal.emit(f"Ошибка запуска сервера: {e}")
+            self.stop()
+
+    def _tcp_host_worker(self):
+        """
+        Обслуживание входящих подключений.
+
+        Сервер продолжает слушать после ухода напарника: раньше цикл завершался
+        после первого accept(), поэтому одно случайное подключение (или сканер
+        портов) навсегда блокировало вход настоящему напарнику.
+        """
+        try:
+            while self.running:
+                try:
+                    conn, addr = self.server_socket.accept()
+                except OSError:
+                    break
+                except Exception:
+                    break
+
+                # Пока заняты текущим напарником — вежливо отказываем
+                if self.is_connected:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
+
+                try:
+                    served = self._tcp_serve_peer(conn, addr[0])
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    if self.peer_socket is conn:
+                        self.peer_socket = None
+                    self.is_connected = False
+                    # Сообщаем об уходе только если напарник действительно был:
+                    # иначе случайный коннект (сканер портов) выглядел бы как
+                    # «напарник отключился».
+                    if served and self.running:
+                        self.disconnected_signal.emit("Напарник отключился")
+        except Exception as e:
+            if self.running:
+                self.status_signal.emit(f"Ошибка соединения: {e}")
+        finally:
+            self.is_connected = False
+
+    def _tcp_serve_peer(self, conn: socket.socket, peer_ip: str) -> bool:
+        """
+        Приветствие и цикл чтения для одного подключившегося напарника.
+        Возвращает True, если напарник реально начал сессию.
+        """
+        self.peer_socket = conn
+        self.is_connected = True
+
+        self._tcp_send({
+            "type": "HANDSHAKE",
+            "sender_id": self.user_id,
+            "name": self.username,
+            "color": self.user_color,
+            "is_host": True
+        })
+
+        # Если после подключения клиент молчит (сканер портов, оборванный
+        # коннект), не держим сервер занятым: ждём первый байт ограниченное время.
+        try:
+            conn.settimeout(5.0)
+            if not conn.recv(1, socket.MSG_PEEK):
+                self.status_signal.emit(f"Подключение с {peer_ip} закрылось без данных")
+                return False
+        except (socket.timeout, OSError):
+            self.status_signal.emit(f"Подключение с {peer_ip} не прислало данных")
+            return False
+        finally:
+            try:
+                conn.settimeout(None)
+            except OSError:
+                pass
+
+        self.status_signal.emit(f"Напарник подключился с {peer_ip}!")
+        self._tcp_listen_loop(conn)
+        return True
+
+    def connect_to_host(self, host_ip: str, port: int = 8765):
+        """Подключение к локальному TCP серверу."""
+        self.stop()
+        self.mode = "tcp"
+        self.is_host = False
+        self.running = True
+
+        self.tcp_thread = threading.Thread(
+            target=self._tcp_client_worker, args=(host_ip, port), daemon=True
+        )
+        self.tcp_thread.start()
+
+    def _tcp_client_worker(self, host_ip: str, port: int):
+        was_connected = False
+        try:
+            self.status_signal.emit(f"Подключение к {host_ip}:{port}...")
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.settimeout(10.0)
+            self.client_socket.connect((host_ip, port))
+            self.client_socket.settimeout(None)
+
+            self.peer_socket = self.client_socket
+            self.is_connected = True
+            was_connected = True
+
+            self._tcp_send({
+                "type": "HANDSHAKE",
+                "sender_id": self.user_id,
+                "name": self.username,
+                "color": self.user_color,
+                "is_host": False
+            })
+            self._tcp_send({
+                "type": "REQUEST_SYNC",
+                "sender_id": self.user_id
+            })
+
+            self.status_signal.emit(f"Успешно подключено к {host_ip}:{port}!")
+            self._tcp_listen_loop(self.client_socket)
+        except Exception as e:
+            self.status_signal.emit(f"Не удалось подключиться: {e}")
+            # Сигнал об обрыве шлём отсюда, только если цикл чтения не запустился;
+            # иначе о потере связи сообщали бы оба места и чат получал дубль.
+            if not was_connected:
+                self.disconnected_signal.emit(str(e))
+        finally:
+            self.is_connected = False
+
+    def _tcp_listen_loop(self, sock: socket.socket):
+        try:
+            while self.running:
+                header = self._recv_exact(sock, 4)
+                if not header:
+                    break
+
+                length = struct.unpack('>I', header)[0]
+                if length <= 0 or length > MAX_FRAME_BYTES:
+                    # Некорректная длина кадра: recv_exact ждал бы данные
+                    # бесконечно, а поток оставался висеть навсегда.
+                    print(f"[DuoPy] Некорректная длина кадра TCP: {length}")
+                    break
+                payload_data = self._recv_exact(sock, length)
+                if not payload_data:
+                    break
+
+                try:
+                    payload = json.loads(payload_data.decode('utf-8'))
+                    self._dispatch_message(payload)
+                except Exception as e:
+                    print(f"Ошибка парсинга TCP: {e}")
+        finally:
+            self.is_connected = False
+
+    def _recv_exact(self, sock: socket.socket, n_bytes: int) -> bytes | None:
+        data = bytearray()
+        while len(data) < n_bytes:
+            packet = sock.recv(n_bytes - len(data))
+            if not packet:
+                return None
+            data.extend(packet)
+        return bytes(data)
+
+    def _tcp_send(self, data: dict):
+        if not self.peer_socket or not self.is_connected:
+            return
+        data["sender_id"] = self.user_id
+        with self.send_lock:
+            try:
+                raw_json = json.dumps(data).encode('utf-8')
+                header = struct.pack('>I', len(raw_json))
+                self.peer_socket.sendall(header + raw_json)
+            except Exception as e:
+                print(f"Ошибка отправки данных в TCP сокет: {e}")
+                self.is_connected = False
+
+    # =========================================================================
+    # ОБЩАЯ МАРШРУТИЗАЦИЯ И ОТПРАВКА СООБЩЕНИЙ
+    # =========================================================================
+
+    def _dispatch_message(self, msg: dict):
+        """Маршрутизация сообщений (для обоих режимов: Cloud и TCP)."""
+        msg_type = msg.get("type")
+
+        if msg_type in ("HANDSHAKE", "JOIN"):
+            pname = msg.get("name", "Напарник")
+            pcolor = msg.get("color", "#ff9800")
+            source = f"Комната {self.room_code}" if self.mode == "cloud" else "Прямое подключение"
+            self.connected_signal.emit(pname, source)
+
+            # Если к нам присоединились, отправляем приветствие в ответ
+            if msg_type == "JOIN" and not msg.get("is_reply"):
+                self._broadcast({
+                    "type": "JOIN",
+                    "name": self.username,
+                    "color": self.user_color,
+                    "is_reply": True
+                })
+
+        elif msg_type == "REQUEST_SYNC":
+            # Напарник попросил актуальный код
+            self.sync_requested_signal.emit()
+
+        elif msg_type == "CODE_UPDATE":
+            code = msg.get("code", "")
+            fname = msg.get("file", "")
+            self.text_received.emit(code)
+            self.file_code_received.emit(code, fname)
+
+        elif msg_type == "CURSOR_MOVE":
+            uid = msg.get("sender_id", "")
+            name = msg.get("name", "")
+            color = msg.get("color", "")
+            line = msg.get("line", 1)
+            col = msg.get("col", 0)
+            pos = msg.get("pos", 0)
+            sel_start = msg.get("sel_start", 0)
+            sel_end = msg.get("sel_end", 0)
+            fname = msg.get("file", "")
+            self.cursor_received.emit(uid, name, color, line, col, pos, sel_start, sel_end, fname)
+
+        elif msg_type == "ACTIVE_FILE":
+            name = msg.get("name", "Напарник")
+            fname = msg.get("file", "")
+            self.peer_file_changed.emit(name, fname)
+
+        elif msg_type == "PROFILE_UPDATE":
+            name = msg.get("name", "Напарник")
+            color = msg.get("color", "")
+            # Отдельный сигнал: раньше апдейт профиля шёл как connected_signal,
+            # и смена имени выглядела как новое подключение с полным ре-синком,
+            # который затирал правки напарника.
+            self.profile_updated.emit(name, color)
+
+        elif msg_type == "RUN_CODE":
+            self.run_code_requested.emit()
+
+        elif msg_type == "STOP_CODE":
+            self.stop_code_requested.emit()
+
+        elif msg_type == "OUTPUT":
+            text = msg.get("text", "")
+            is_err = msg.get("is_err", False)
+            self.output_received.emit(text, is_err)
+
+        elif msg_type == "EXEC_FINISHED":
+            code = msg.get("code", 0)
+            duration = msg.get("duration", 0.0)
+            self.execution_finished_received.emit(code, duration)
+
+        elif msg_type == "ERROR_LINE":
+            line = msg.get("line", -1)
+            text = msg.get("message", "")
+            self.error_highlight_received.emit(line, text)
+
+        elif msg_type == "CHAT":
+            sender = msg.get("sender", "")
+            content = msg.get("message", "")
+            t_str = msg.get("time", "")
+            self.chat_received.emit(sender, content, t_str)
+
+        elif msg_type == "LEAVE":
+            name = msg.get("name", "Напарник")
+            reason = msg.get("reason", "покинул комнату")
+            self.disconnected_signal.emit(f"{name} {reason}")
+
+        elif msg_type == "STDIN_INPUT":
+            text = msg.get("text", "")
+            self.stdin_received.emit(text)
+
+        elif msg_type == "PROJECT_TREE":
+            pname = msg.get("project_name", "Проект")
+            files = msg.get("files", [])
+            self.project_tree_received.emit(pname, files)
+
+        elif msg_type == "GET_FILE":
+            path = msg.get("path", "")
+            self.file_content_requested.emit(path)
+
+        elif msg_type == "FILE_DATA":
+            path = msg.get("path", "")
+            content = msg.get("content", "")
+            self.file_content_received.emit(path, content)
+
+        elif msg_type == "CREATE_FILE":
+            path = msg.get("path", "")
+            self.file_create_requested.emit(path)
+
+        elif msg_type == "DELETE_FILE":
+            path = msg.get("path", "")
+            self.file_delete_requested.emit(path)
+
+        elif msg_type == "SAVE_FILE":
+            path = msg.get("path", "")
+            content = msg.get("content", "")
+            self.file_save_requested.emit(path, content)
+
+    def _broadcast(self, data: dict):
+        """Отправка сообщения в активный канал (Cloud или TCP)."""
+        if self.mode == "cloud":
+            self._cloud_send(data)
+        elif self.mode == "tcp":
+            self._tcp_send(data)
+
+    # Публичные методы отправки
+    def send_code_update(self, code: str, file_name: str = ""):
+        self._broadcast({"type": "CODE_UPDATE", "code": code, "file": file_name})
+
+    def send_project_tree(self, project_name: str, files: list[dict]):
+        """Отправка структуры файлов проекта напарнику."""
+        self._broadcast({"type": "PROJECT_TREE", "project_name": project_name, "files": files})
+
+    def send_request_file(self, rel_path: str):
+        """Запрос содержимого файла у хоста."""
+        self._broadcast({"type": "GET_FILE", "path": rel_path})
+
+    def send_file_data(self, rel_path: str, content: str):
+        """Отправка содержимого файла гостю."""
+        self._broadcast({"type": "FILE_DATA", "path": rel_path, "content": content})
+
+    def send_create_file(self, rel_path: str):
+        """Запрос на создание нового файла в проекте."""
+        self._broadcast({"type": "CREATE_FILE", "path": rel_path})
+
+    def send_delete_file(self, rel_path: str):
+        """Запрос на удаление файла из проекта."""
+        self._broadcast({"type": "DELETE_FILE", "path": rel_path})
+
+    def send_save_file(self, rel_path: str, content: str):
+        """Отправка сохраненного содержимого файла хосту для записи на диск."""
+        self._broadcast({"type": "SAVE_FILE", "path": rel_path, "content": content})
+
+    def send_sync_request(self):
+        """Запрос актуального состояния проекта и кода у хоста."""
+        self._broadcast({"type": "REQUEST_SYNC"})
+
+
+    def send_cursor_position(self, line: int, col: int, pos: int = 0, sel_start: int = 0, sel_end: int = 0, file_name: str = ""):
+        self._broadcast({
+            "type": "CURSOR_MOVE",
+            "name": self.username,
+            "color": self.user_color,
+            "line": line,
+            "col": col,
+            "pos": pos,
+            "sel_start": sel_start,
+            "sel_end": sel_end,
+            "file": file_name
+        })
+
+    def send_active_file(self, file_name: str):
+        """Оповещение напарника о переключении на другой файл."""
+        self._broadcast({
+            "type": "ACTIVE_FILE",
+            "name": self.username,
+            "file": file_name
+        })
+
+    def send_profile_update(self, name: str, color: str):
+        """Оповещение напарника об изменении имени или цвета."""
+        self.username = name
+        self.user_color = color
+        self._broadcast({
+            "type": "PROFILE_UPDATE",
+            "name": name,
+            "color": color
+        })
+
+    def send_run_command(self):
+        self._broadcast({"type": "RUN_CODE"})
+
+    def send_stop_command(self):
+        self._broadcast({"type": "STOP_CODE"})
+
+    def send_output(self, text: str, is_err: bool = False):
+        self._broadcast({"type": "OUTPUT", "text": text, "is_err": is_err})
+
+    def send_execution_finished(self, return_code: int, duration: float):
+        self._broadcast({"type": "EXEC_FINISHED", "code": return_code, "duration": duration})
+
+    def send_error_line(self, line: int, message: str):
+        self._broadcast({"type": "ERROR_LINE", "line": line, "message": message})
+
+    def send_chat_message(self, message: str) -> str:
+        now_str = datetime.now().strftime("%H:%M:%S")
+        self._broadcast({
+            "type": "CHAT",
+            "sender": self.username,
+            "message": message,
+            "time": now_str
+        })
+        return now_str
+
+    def send_stdin_input(self, text: str):
+        """Отправка введенных данных input() напарнику."""
+        self._broadcast({"type": "STDIN_INPUT", "text": text})
+
+    def stop(self):
+        """Закрытие всех соединений."""
+        self.running = False
+        self.is_connected = False
+        self.initial_joined = False
+
+        if self.mqtt_client:
+            try:
+                # Оповещаем об уходе
+                if self.room_code:
+                    self._cloud_send({"type": "LEAVE", "name": self.username})
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+            except Exception:
+                pass
+            self.mqtt_client = None
+
+        if self.peer_socket:
+            try:
+                self.peer_socket.shutdown(socket.SHUT_RDWR)
+                self.peer_socket.close()
+            except Exception:
+                pass
+            self.peer_socket = None
+
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
+
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except Exception:
+                pass
+            self.client_socket = None
