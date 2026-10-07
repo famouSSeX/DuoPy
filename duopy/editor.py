@@ -148,6 +148,14 @@ class CodeEditor(QPlainTextEdit):
         # Включение мышиного отслеживания для всплывающих подсказок ошибок
         self.setMouseTracking(True)
 
+        # Таймер «пользователь печатает»: пока он активен, входящая правка в
+        # области набора откладывается, а по паузе применяется. Раньше ожидание
+        # было привязано к уходу напарника со строки — при обычном наборе он с
+        # неё не уходит, поэтому правка не появлялась вообще.
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setSingleShot(True)
+        self._typing_timer.timeout.connect(self.flush_deferred_remote_update)
+
         # Настройки редактора
         self.setStyleSheet("""
             QPlainTextEdit {
@@ -727,6 +735,8 @@ class CodeEditor(QPlainTextEdit):
         if self.search_matches:
             self.search_is_stale = True
         if not self.is_applying_remote_update and not self._loading_programmatically:
+            # Набор пользователя: отложенная правка напарника подождёт паузы
+            self._typing_timer.start(900)
             self.code_changed_by_user.emit(self.toPlainText())
 
     def highlight_current_line(self):
@@ -938,17 +948,16 @@ class CodeEditor(QPlainTextEdit):
         old_end = len(current_text) - suffix_len
         new_replacement = new_text[prefix_len : len(new_text) - suffix_len]
 
-        if defer_on_conflict and old_start < old_end:
+        if defer_on_conflict and old_start < old_end and self._typing_timer.isActive():
+            # Откладываем ТОЛЬКО пока пользователь активно печатает: иначе
+            # правка напарника не появлялась бы вообще, пока он находится на
+            # той же строке, что и вы (это и была причина «не вижу, как он пишет»).
             res_start, res_end = self._local_edit_reservation()
             if self._ranges_overlap(old_start, old_end, res_start, res_end):
                 self._deferred_remote_update = {
                     "text": new_text,
                     "old_start": old_start,
                     "old_end": old_end,
-                    # Снимок состояния на момент откладывания: если пользователь
-                    # с тех пор ничего не изменил, обновление можно применять.
-                    "base_text": current_text,
-                    "base_cursor": cur_pos,
                 }
                 return False
 
@@ -992,6 +1001,9 @@ class CodeEditor(QPlainTextEdit):
             self.horizontalScrollBar().setValue(h_scroll)
         finally:
             self.is_applying_remote_update = False
+            # Наша собственная применённая правка — не «набор пользователя»:
+            # иначе следующие 0.9 с правки напарника снова откладывались бы.
+            self._typing_timer.stop()
             self.highlight_current_line()
             # Линтер гоняем через тот же debounce-таймер, а не синхронно: напарник
             # шлёт апдейты каждые ~120 мс, и полный ast.parse блокировал GUI.
@@ -1000,17 +1012,15 @@ class CodeEditor(QPlainTextEdit):
         return True
 
     def flush_deferred_remote_update(self):
-        """Применение отложенного обновления, когда локальная правка завершена."""
+        """
+        Применение отложенного обновления, когда пользователь сделал паузу.
+
+        Вызывается таймером набора, уходом напарника и сменой файла. Никаких
+        дополнительных условий: отложенная правка обязана примениться, иначе
+        стороны расходятся навсегда (именно это и происходило).
+        """
         pending = self._deferred_remote_update
         if not pending:
-            return False
-        cursor = self.textCursor()
-        # Обновление применяем, если с момента откладывания пользователь ничего
-        # не изменил и не сдвинул каретку. Иначе держим дальше: набранный текст
-        # важнее, а напарник получит нашу версию при следующей отправке.
-        unchanged = (self.toPlainText() == pending.get("base_text")
-                     and cursor.position() == pending.get("base_cursor"))
-        if not unchanged:
             return False
         self._deferred_remote_update = None
         return self.apply_remote_code(pending["text"])
