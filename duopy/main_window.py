@@ -1588,8 +1588,9 @@ class MainWindow(QMainWindow):
         """Применение кода от напарника с привязкой к вкладке/файлу."""
         if not file_name or not self.tabs:
             self.editor.apply_remote_code(code, defer_on_conflict=True)
+            self.editor.flush_deferred_remote_update()
             if 0 <= self.current_tab_index < len(self.tabs):
-                self.tabs[self.current_tab_index]["content"] = code
+                self.tabs[self.current_tab_index]["content"] = self.editor.toPlainText()
             return
 
         matched_idx = self._find_remote_tab(file_name)
@@ -1599,15 +1600,17 @@ class MainWindow(QMainWindow):
                 # (возможно, устаревший) вариант — иначе правки напарника гибнут.
                 self._suppress_code_echo = True
                 try:
-                    applied = self.editor.apply_remote_code(code, defer_on_conflict=True)
+                    self.editor.apply_remote_code(code, defer_on_conflict=True)
+                    # Правку, отложенную из-за набора, применяем сразу после
+                    # паузы: иначе стороны расходятся и текст не появляется.
+                    self.editor.flush_deferred_remote_update()
                 finally:
                     self._suppress_code_echo = False
-            else:
-                applied = True
-            # Кэш обновляем только для применённого текста: иначе отложенное
-            # обновление было бы потеряно при следующем переключении вкладки.
-            if applied:
-                self.tabs[matched_idx]["content"] = code
+            # Кэш берём из редактора: там итоговый текст с учётом отложенной
+            # правки, а не устаревший снимок из сети.
+            self.tabs[matched_idx]["content"] = (
+                self.editor.toPlainText() if matched_idx == self.current_tab_index else code
+            )
             return
 
         # Если открыта единственная пустая вкладка без файла — переиспользуем её
