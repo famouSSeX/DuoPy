@@ -1,9 +1,9 @@
-# Метаданные версии для сборки DuoPy.exe (PyInstaller --version-file).
-# Значения взяты из duopy/updater.py: APP_VERSION = "1.2.0".
+﻿# Метаданные версии для сборки DuoPy.exe (PyInstaller --version-file).
+# Значения синхронизированы с APP_VERSION в duopy/updater.py: "1.2.1".
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 2, 0, 0),
-    prodvers=(1, 2, 0, 0),
+    filevers=(1, 2, 1, 0),
+    prodvers=(1, 2, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           '041904b0',
           [StringStruct('CompanyName', 'DuoPy'),
            StringStruct('FileDescription', 'DuoPy — совместная среда разработки на Python'),
-           StringStruct('FileVersion', '1.2.0'),
+           StringStruct('FileVersion', '1.2.1'),
            StringStruct('InternalName', 'DuoPy'),
            StringStruct('LegalCopyright', 'DuoPy'),
            StringStruct('OriginalFilename', 'DuoPy.exe'),
            StringStruct('ProductName', 'DuoPy'),
-           StringStruct('ProductVersion', '1.2.0')])
+           StringStruct('ProductVersion', '1.2.1')])
       ]),
     VarFileInfo([VarStruct('Translation', [1049, 1200])])
   ]
