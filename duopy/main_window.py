@@ -997,6 +997,7 @@ class MainWindow(QMainWindow):
         self.network.stdin_received.connect(self.on_remote_stdin_received)
         self.network.project_tree_received.connect(self.on_remote_project_tree_received)
         self.network.metrics_updated.connect(self.on_metrics_updated)
+        self.network.transport_changed.connect(self.on_transport_changed)
         self.network.file_content_requested.connect(self.on_remote_file_content_requested)
         self.network.file_content_received.connect(self.on_remote_file_content_received)
         self.network.file_create_requested.connect(self.on_remote_file_create_requested)
@@ -1433,6 +1434,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Сессия завершена. Режим: Одиночный")
         self._stop_metrics()
 
+    def on_transport_changed(self, endpoint: str, kind: str):
+        """
+        Канал связи с напарником переключился.
+
+        В облачной комнате трафик сначала идёт через посредника, а после
+        пробивания NAT — напрямую. Прямой канал в разы быстрее, поэтому
+        показываем его в статус-баре.
+        """
+        if kind == "p2p":
+            self.statusBar().showMessage(
+                f"⚡ Прямое соединение с напарником: {endpoint}", 8000)
+            self.append_chat_system(f"Прямое соединение установлено ({endpoint})")
+        else:
+            self.append_chat_system("Прямое соединение недоступно, работаем через сервер комнат")
+        self._update_speed_label()
+
     def on_peer_connected(self, peer_name: str, source: str):
         is_reconnect = (self.peer_name == peer_name)
         self.peer_name = peer_name
@@ -1605,7 +1622,10 @@ class MainWindow(QMainWindow):
             else:
                 icon, color = "🔴", "#f48771"
             shown = f"{latency:.0f} мс" if latency >= 1 else "<1 мс"
-            text = f"{icon} {shown} · {rate:.1f} КБ/с"
+            # Прямое соединение помечаем молнией: сразу видно, идёт обмен
+            # напрямую или ещё через посредника
+            mark = "⚡ " if getattr(self.network, "transport", "") == "p2p" else ""
+            text = f"{mark}{icon} {shown} · {rate:.1f} КБ/с"
 
         self.lbl_sb_speed.setText(text)
         self.lbl_sb_speed.setStyleSheet(f"margin-right: 10px; color: {color};")
