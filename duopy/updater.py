@@ -20,14 +20,14 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-from PyQt6.QtCore import QThread, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
     QVBoxLayout
 )
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_OWNER = "famouSSeX"
 GITHUB_REPO = "DuoPy"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -291,10 +291,148 @@ endlocal
                   "запустится автоматически.")
 
 
+class ConnectionStatsDialog(QDialog):
+    """Окно качества связи: задержка, скорость передачи текста, объёмы за сессию."""
+
+    def __init__(self, network, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Скорость соединения")
+        self.resize(460, 300)
+        self.network = network
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        title = QLabel("📶 <b>Качество связи с напарником</b>")
+        title.setStyleSheet("font-size: 14px; color: #4ec9b0;")
+        layout.addWidget(title)
+
+        self.lbl_mode = QLabel()
+        self.lbl_mode.setStyleSheet("color: #858585; font-size: 11px;")
+        self.lbl_mode.setWordWrap(True)
+        layout.addWidget(self.lbl_mode)
+
+        self.lbl_grid = QLabel()
+        self.lbl_grid.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_grid.setStyleSheet("font-size: 12px; color: #cccccc;")
+        self.lbl_grid.setWordWrap(True)
+        layout.addWidget(self.lbl_grid)
+
+        self.lbl_history = QLabel()
+        self.lbl_history.setStyleSheet(
+            "color: #9cdcfe; font-family: Consolas, monospace; font-size: 12px; "
+            "background-color: #1a1a1a; border-radius: 4px; padding: 6px;"
+        )
+        layout.addWidget(self.lbl_history)
+
+        layout.addStretch()
+
+        btns = QHBoxLayout()
+        btn_reset = QPushButton("Сбросить замеры")
+        btn_reset.clicked.connect(self._reset)
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        btns.addWidget(btn_reset)
+        btns.addStretch()
+        btns.addWidget(btn_close)
+        layout.addLayout(btns)
+
+        # Обновляем показания раз в секунду, пока окно открыто
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+        self.refresh()
+
+    def _reset(self):
+        if self.network:
+            self.network.reset_metrics()
+        self.refresh()
+
+    def refresh(self):
+        """Обновление показаний из сетевого менеджера."""
+        net = self.network
+        if net is None:
+            self.lbl_mode.setText("Сетевой модуль недоступен")
+            return
+
+        connected = bool(net.is_connected)
+        if not connected:
+            self.lbl_mode.setText("Соединение не активно — замеры начнутся после подключения.")
+            self.lbl_grid.setText("")
+            self.lbl_history.setText("")
+            return
+
+        mode = "облачная комната " + (net.room_code or "") if net.mode == "cloud" \
+            else "прямое подключение (LAN/IP)"
+        transport = "шифрованный канал" if net.mode == "cloud" else "локальная сеть"
+        self.lbl_mode.setText(f"Режим: {mode} · {transport}")
+
+        latency = net.latency_ms
+        avg = net.latency_avg_ms
+        peak = net.rtt_peak_ms
+        measured = bool(net.latency_samples)
+        quality, color = self._quality(latency if measured else -1)
+        shown = f"{latency:.0f}" if latency >= 1 else "<1"
+        avg_shown = f"{avg:.0f}" if avg >= 1 else "<1"
+        peak_shown = f"{peak:.0f}" if peak >= 1 else "<1"
+
+        self.lbl_grid.setText(
+            f"<table cellspacing='6'>"
+            f"<tr><td>Задержка (сейчас):</td><td><b style='color:{color}'>{shown} мс</b> {quality}</td></tr>"
+            f"<tr><td>Средняя задержка:</td><td>{avg_shown} мс</td></tr>"
+            f"<tr><td>Худшая задержка:</td><td>{peak_shown} мс</td></tr>"
+            f"<tr><td>Приём текста:</td><td>{net.rate_in_bps / 1024:.1f} КБ/с</td></tr>"
+            f"<tr><td>Отправка текста:</td><td>{net.rate_out_bps / 1024:.1f} КБ/с</td></tr>"
+            f"<tr><td>Пиковая скорость:</td><td>{net.throughput_peak_bps / 1024:.1f} КБ/с</td></tr>"
+            f"<tr><td>Передано за сессию:</td><td>↑ {self._human(net.bytes_out)} · ↓ {self._human(net.bytes_in)}</td></tr>"
+            f"</table>"
+        )
+
+        samples = net.latency_samples[-20:]
+        self.lbl_history.setText(self._sparkline(samples))
+
+    @staticmethod
+    def _quality(latency_ms: float) -> tuple[str, str]:
+        """Словесная оценка и цвет индикатора по задержке (-1 — замер ещё не было)."""
+        if latency_ms < 0:
+            return "измеряется...", "#858585"
+        if latency_ms < 60:
+            return "отлично", "#7ee787"
+        if latency_ms < 150:
+            return "хорошо", "#4ec9b0"
+        if latency_ms < 400:
+            return "заметная задержка", "#e5c07b"
+        return "высокая задержка", "#f48771"
+
+    @staticmethod
+    def _human(num_bytes: float) -> str:
+        """Человекочитаемый объём."""
+        for unit in ("Б", "КБ", "МБ"):
+            if num_bytes < 1024 or unit == "МБ":
+                return f"{num_bytes:.1f} {unit}" if unit != "Б" else f"{int(num_bytes)} Б"
+            num_bytes /= 1024
+        return f"{num_bytes:.1f} МБ"
+
+    @staticmethod
+    def _sparkline(samples: list) -> str:
+        """Простая история задержек блоками (без графиков и лишних зависимостей)."""
+        if not samples:
+            return "история замеров: пока пусто"
+        blocks = "▁▂▃▄▅▆▇█"
+        lowest, highest = min(samples), max(samples)
+        span = max(1.0, highest - lowest)
+        line = ""
+        for value in samples:
+            idx = int((value - lowest) / span * (len(blocks) - 1))
+            line += blocks[idx]
+        return f"история (мс): {lowest:.0f} … {highest:.0f}\n{line}"
+
+
 class AboutAndUpdatesDialog(QDialog):
     """Диалог с информацией о версии, ссылкой на GitHub и проверкой обновлений."""
 
-    def __init__(self, parent=None, silent: bool = False):
+    def __init__(self, parent=None, silent: bool = False, network=None):
         super().__init__(parent)
         self.setWindowTitle("О программе и обновлениях DuoPy")
         self.resize(520, 340)
@@ -302,6 +440,7 @@ class AboutAndUpdatesDialog(QDialog):
         # silent: проверка при старте приложения — без лишних диалогов,
         # сообщаем только когда действительно есть новая версия
         self.silent = silent
+        self.network = network
         self.release: ReleaseInfo | None = None
         self.check_thread: UpdateCheckThread | None = None
         self.download_thread: UpdateDownloadThread | None = None
@@ -347,15 +486,24 @@ class AboutAndUpdatesDialog(QDialog):
         btn_git = QPushButton("🌐 Открыть GitHub")
         btn_git.clicked.connect(self._open_git)
 
+        self.btn_speed = QPushButton("📶 Скорость соединения")
+        self.btn_speed.setToolTip("Задержка и скорость связи с напарником")
+        self.btn_speed.clicked.connect(self._open_speed)
+
         btn_close = QPushButton("Закрыть")
         btn_close.clicked.connect(self.accept)
 
         btns_row.addWidget(self.btn_check)
         btns_row.addWidget(self.btn_install)
+        btns_row.addWidget(self.btn_speed)
         btns_row.addWidget(btn_git)
         btns_row.addStretch()
         btns_row.addWidget(btn_close)
         layout.addLayout(btns_row)
+
+    def _open_speed(self):
+        """Окно качества связи (доступно и без напарника — покажет подсказку)."""
+        ConnectionStatsDialog(self.network, self).exec()
 
     # ------------------------------------------------------------------ UI
 
