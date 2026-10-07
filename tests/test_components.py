@@ -1186,5 +1186,142 @@ class TestConnectionSpeed(unittest.TestCase):
             win.close()
 
 
+class TestDeltaSync(unittest.TestCase):
+    """Передача только изменённого фрагмента: порядок, размер, потери."""
+
+    def _prepared_pair(self, text):
+        """Два редактора с одинаковым текстом и согласованными метками."""
+        a, b = CodeEditor(), CodeEditor()
+        a.load_text_programmatically(text)
+        b.load_text_programmatically(text)
+        a.mark_synced(text)
+        b.mark_synced(text)
+        return a, b
+
+    def test_sequential_typing_keeps_order(self):
+        """
+        Последовательный набор не должен менять порядок символов.
+
+        Регрессия: позиция правки ограничивалась длиной базового текста, а не
+        текущего документа, поэтому каждое следующее нажатие вставлялось в
+        прежнее место и символы вставали задом наперёд («ZYX» вместо «XYZ»).
+        """
+        big = "".join(f"def f_{i}(a, b):\n    return a + b + {i}\n" for i in range(500))
+        a, b = self._prepared_pair(big)
+
+        for i, ch in enumerate("XYZ"):
+            cursor = a.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            a.setTextCursor(cursor)
+            a.insertPlainText(ch)
+            delta = a.capture_send_delta()
+            self.assertTrue(b.apply_remote_delta(*delta), f"правка {ch} должна примениться")
+
+        self.assertTrue(a.toPlainText().endswith("XYZ"), a.toPlainText()[-10:])
+        self.assertEqual(a.toPlainText(), b.toPlainText(), "тексты должны совпасть")
+        a.close()
+        b.close()
+
+    def test_delta_is_small_for_large_file(self):
+        """Правка в большом файле передаёт байты, а не весь файл."""
+        big = "".join(f"value_{i} = {i}\n" for i in range(10000))
+        a, _ = self._prepared_pair(big)
+
+        cursor = a.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        a.setTextCursor(cursor)
+        a.insertPlainText("x")
+        pos, removed, insert, digest = a.capture_send_delta()
+
+        self.assertEqual(insert, "x")
+        self.assertEqual(removed, 0)
+        self.assertLess(len(insert.encode()), 8, "уходит только фрагмент")
+        self.assertTrue(digest, "метка версии должна передаваться")
+        self.assertGreater(len(big), 100_000, "файл для теста должен быть большим")
+        a.close()
+
+    def test_no_delta_when_nothing_changed(self):
+        """Без правок отправлять нечего."""
+        a, _ = self._prepared_pair("print(1)\n")
+        pos, removed, insert, _ = a.capture_send_delta()
+        self.assertEqual((pos, removed, insert), (0, 0, ""))
+        a.close()
+
+    def test_stale_delta_is_rejected(self):
+        """Правка, основанная на устаревшей версии, не применяется."""
+        a, b = self._prepared_pair("abcdef")
+        # Метка не совпадает с последним отправленным текстом
+        applied = b.apply_remote_delta(2, 3, "ZZZ", "0000000000000000")
+        self.assertFalse(applied)
+        self.assertEqual(b.toPlainText(), "abcdef", "текст не должен меняться")
+        a.close()
+        b.close()
+
+    def test_offset_delta_applied_with_shift(self):
+        """Правка применяется, даже если мы уже печатали в другом месте."""
+        text = "aaa\nbbb\nccc\n"
+        a, b = self._prepared_pair(text)
+
+        # b печатает в начале, a — в конце: области не пересекаются
+        cursor = b.textCursor()
+        cursor.setPosition(0)
+        b.setTextCursor(cursor)
+        b.insertPlainText("B")
+        b.mark_synced(text)          # напарник ещё не знает о нашей правке
+
+        cursor = a.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        a.setTextCursor(cursor)
+        a.insertPlainText("A")
+        delta = a.capture_send_delta()
+
+        self.assertTrue(b.apply_remote_delta(*delta), "непересекающуюся правку нужно применить")
+        self.assertIn("Baaa", b.toPlainText())
+        self.assertTrue(b.toPlainText().endswith("A"))
+        a.close()
+        b.close()
+
+    def test_loss_detection_by_sequence(self):
+        """Пропуск номера правки распознаётся как потеря."""
+        from duopy.network import NetworkManager
+        net = NetworkManager("Тест")
+        losses = []
+        net.edit_loss_detected.connect(lambda: losses.append(1))
+        received = []
+        net.code_edit_received.connect(lambda *args: received.append(args))
+
+        net._dispatch_message({"type": "CODE_EDIT", "pos": 0, "removed": 0,
+                               "insert": "a", "file": "f.py", "base": "x", "seq": 1})
+        self.assertEqual(len(received), 1, "первая правка применяется")
+        self.assertEqual(len(losses), 0)
+
+        # Пропуск номера 2 — потеря
+        net._dispatch_message({"type": "CODE_EDIT", "pos": 1, "removed": 0,
+                               "insert": "b", "file": "f.py", "base": "x", "seq": 3})
+        self.assertEqual(len(losses), 1, "пропуск номера должен обнаруживаться")
+        self.assertEqual(len(received), 1, "правка после потери не применяется")
+
+    def test_large_message_is_compressed(self):
+        """Крупные сообщения сжимаются, мелкие отправляются как есть."""
+        from duopy.network import NetworkManager, COMPRESS_THRESHOLD_BYTES
+        net = NetworkManager("Тест")
+
+        small = {"type": "CODE_UPDATE", "code": "x = 1", "file": "a.py"}
+        self.assertEqual(net._maybe_compress(small), small, "мелкое не сжимаем")
+
+        big = {"type": "CODE_UPDATE",
+               "code": "".join(f"def f_{i}(a, b):\n    return a + b\n" for i in range(2000)),
+               "file": "big.py"}
+        packed = net._maybe_compress(big)
+        self.assertEqual(packed.get("type"), "PACKED", "крупное должно сжаться")
+        import json
+        raw_size = len(json.dumps(big, separators=(",", ":")))
+        packed_size = len(json.dumps(packed))
+        self.assertLess(packed_size, raw_size / 2, "сжатие должно давать выигрыш")
+        # И распаковывается обратно
+        self.assertEqual(net._unpack(packed)["file"], "big.py")
+        self.assertGreater(raw_size, COMPRESS_THRESHOLD_BYTES)
+
+
 if __name__ == "__main__":
     unittest.main()
