@@ -13,6 +13,7 @@
 import sys
 import os
 import html
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSplitter, QTextEdit, QLineEdit, QListWidget, QListWidgetItem,
@@ -465,6 +466,9 @@ class MainWindow(QMainWindow):
         self._suppress_remote_run_echo = False
         # Подавление отправки кода, пока применяется обновление от напарника
         self._suppress_code_echo = False
+        # Идёт выравнивание состояния (после потери правок или наложения):
+        # фрагменты в это время не применяем, ждём полный текст
+        self._sync_pending = False
         # Вкладка и сессия, к которым относятся отложенные правки
         self._pending_sync_tab: int | None = None
         self._pending_sync_session: int | None = None
@@ -972,11 +976,14 @@ class MainWindow(QMainWindow):
         self.editor.cursor_position_changed.connect(self.on_local_cursor_moved)
         self.editor.linter_issues_changed.connect(self.on_linter_issues_changed)
         self.editor.line_locked_warning.connect(self.on_line_locked_warning)
+        self.editor.divergence_detected.connect(self.on_divergence_detected)
 
         self.network.connected_signal.connect(self.on_peer_connected)
         self.network.disconnected_signal.connect(self.on_peer_disconnected)
         self.network.peer_file_changed.connect(self.on_peer_file_changed)
         self.network.file_code_received.connect(self.on_remote_code_received)
+        self.network.code_edit_received.connect(self.on_remote_code_edit)
+        self.network.edit_loss_detected.connect(self.on_edit_loss_detected)
         self.network.cursor_received.connect(self.on_remote_cursor_received)
         self.network.run_code_requested.connect(self.on_remote_run_requested)
         self.network.stop_code_requested.connect(self.on_remote_stop_requested)
@@ -1439,7 +1446,11 @@ class MainWindow(QMainWindow):
     def _send_full_sync(self):
         """Отправка напарнику текущего кода и структуры проекта."""
         self._save_current_tab_content()
-        self.network.send_code_update(self.editor.toPlainText(), self._current_file_title())
+        text = self.editor.toPlainText()
+        self.network.send_code_update(text, self._current_file_title())
+        # После полной синхронизации фиксируем базу: дальше будут уходить
+        # только изменённые фрагменты, а не файл целиком
+        self.editor.mark_synced(text)
         self._broadcast_project_manifest()
 
     def _clear_peer_editor_state(self):
@@ -1468,11 +1479,7 @@ class MainWindow(QMainWindow):
     def on_sync_requested(self):
         """Новый участник запросил актуальный код и дерево проекта."""
         if self.network.is_host:
-            cur_file = ""
-            if 0 <= self.current_tab_index < len(self.tabs):
-                cur_file = self.tabs[self.current_tab_index]["title"]
-            self.network.send_code_update(self.editor.toPlainText(), cur_file)
-            self._broadcast_project_manifest()
+            self._send_full_sync()
 
     def on_network_status(self, msg: str):
         self.statusBar().showMessage(msg)
@@ -1619,6 +1626,44 @@ class MainWindow(QMainWindow):
         dialog = ConnectionStatsDialog(self.network, self)
         dialog.exec()
 
+    def on_divergence_detected(self):
+        """
+        Свои правки и правки напарника наложились друг на друга.
+
+        Слить их корректно без общей истории нельзя, поэтому стороны
+        синхронизируются полностью: хост отправляет свой текст, гость просит
+        прислать актуальную версию. Так расхождение не остаётся навсегда.
+        """
+        self.statusBar().showMessage("Правки наложились, синхронизирую версии...", 3000)
+        self.append_chat_system("Обнаружено наложение правок, выполнена полная синхронизация")
+
+        if self.network.is_host:
+            self._send_full_sync()
+        else:
+            # Свой текст не теряем: сохраняем копию рядом с проектом
+            self._backup_conflicting_text()
+            self.network.send_sync_request()
+
+    def _backup_conflicting_text(self):
+        """
+        Сохранение своей версии файла при наложении правок.
+
+        Гость получит версию хоста, поэтому его вариант (с наложением) стоит
+        сохранить рядом — иначе локальные правки исчезли бы без следа.
+        """
+        try:
+            title = self._current_file_title() or "main.py"
+            safe = os.path.basename(title)
+            backup_dir = os.path.join(self.project_path, ".duopy_conflicts")
+            os.makedirs(backup_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(backup_dir, f"{stamp}_{safe}")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.editor.toPlainText())
+            self.statusBar().showMessage(f"Ваша версия сохранена: {path}", 5000)
+        except Exception as e:
+            print(f"[DuoPy] Не удалось сохранить резервную копию: {e}")
+
     def on_local_code_changed(self, new_code: str):
         if 0 <= self.current_tab_index < len(self.tabs):
             tab = self.tabs[self.current_tab_index]
@@ -1629,10 +1674,23 @@ class MainWindow(QMainWindow):
         if self._session_alive() and not self._suppress_code_echo:
             self._pending_sync_tab = self.current_tab_index
             self._pending_sync_session = id(self.network)
-            self.code_sync_timer.start(120)
+            # Фрагмент весит десятки байт, поэтому отправлять можно чаще, чем
+            # раньше (120 мс задавалось для пересылки всего файла целиком)
+            self.code_sync_timer.start(60)
+
+    # До этого размера отправляем файл целиком: конфликты одновременного
+    # набора сходятся сами (последний победил), а разница в скорости незаметна.
+    # Крупные файлы передавать целиком слишком дорого — там шлём фрагмент.
+    DELTA_MODE_FROM_CHARS = 8000
 
     def _flush_code_update(self):
-        """Отправка кода после дебаунс-паузы для плавной синхронизации."""
+        """
+        Отправка накопленных правок.
+
+        Для небольших файлов уходит весь текст (это устойчиво к одновременному
+        набору и стоит доли миллисекунды), для больших — только изменённый
+        фрагмент: пересылка 100 КБ на публичный брокер занимала около двух секунд.
+        """
         if not self._session_alive():
             return
         # Сессия пересоздана или вкладку успели сменить — старые правки уже
@@ -1641,9 +1699,90 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, "_pending_sync_tab", self.current_tab_index) != self.current_tab_index:
             return
+
+        text = self.editor.toPlainText()
         if 0 <= self.current_tab_index < len(self.tabs):
-            self.tabs[self.current_tab_index]["content"] = self.editor.toPlainText()
-        self.network.send_code_update(self.editor.toPlainText(), self._current_file_title())
+            self.tabs[self.current_tab_index]["content"] = text
+
+        if len(text) < self.DELTA_MODE_FROM_CHARS:
+            self.editor.mark_synced(text)
+            self.network.send_code_update(text, self._current_file_title())
+            return
+
+        try:
+            pos, removed, insert, digest = self.editor.capture_send_delta()
+        except Exception as e:
+            # Если минимальную правку посчитать не удалось, отправляем файл целиком:
+            # лучше дороже, чем потерять изменение
+            print(f"[DuoPy] Не удалось вычислить правку, отправляю файл целиком: {e}")
+            self.editor.mark_synced(text)
+            self.network.send_code_update(text, self._current_file_title())
+            return
+
+        if pos == 0 and removed == 0 and not insert:
+            return          # отправлять нечего: текст уже совпадает с базой
+        self.network.send_code_delta(pos, removed, insert,
+                                     self._current_file_title(), digest)
+
+    def on_edit_loss_detected(self):
+        """
+        Часть правок напарника потерялась в сети.
+
+        Правки идут без подтверждения доставки (QoS 0) — иначе каждое нажатие
+        платило бы полным кругом задержки. Потерю замечаем по пропуску номера
+        и сразу выравниваем состояние: гость просит актуальный текст, хост его
+        отправляет.
+        """
+        if self._sync_pending:
+            return
+        self._sync_pending = True
+        self.append_chat_system("Потеряна часть правок, выполняю синхронизацию")
+        if self.network.is_host:
+            self._send_full_sync()
+        else:
+            self.network.send_sync_request()
+
+    def on_remote_code_edit(self, pos: int, removed: int, insert: str,
+                            file_name: str = "", base_digest: str = ""):
+        """Применение правки напарника, пришедшей фрагментом."""
+        # Пока идёт выравнивание, правки основаны на устаревшем тексте —
+        # применяем только метку номера, содержимое придёт полным снапшотом
+        if self._sync_pending:
+            return
+        if not file_name or not self.tabs:
+            if not self.editor.apply_remote_delta(pos, removed, insert, base_digest):
+                self.network.send_sync_request()
+            if 0 <= self.current_tab_index < len(self.tabs):
+                self.tabs[self.current_tab_index]["content"] = self.editor.toPlainText()
+            return
+
+        matched_idx = self._find_remote_tab(file_name)
+        if matched_idx >= 0 and matched_idx != self.current_tab_index:
+            # Вкладка не активна: правку применим, когда её откроют, а пока
+            # храним накопленный текст в кэше вкладки
+            cached = self.tabs[matched_idx].get("content", "")
+            pos = max(0, min(pos, len(cached)))
+            removed = max(0, min(removed, len(cached) - pos))
+            self.tabs[matched_idx]["content"] = cached[:pos] + insert + cached[pos + removed:]
+            return
+
+        if matched_idx < 0:
+            # Файл ещё не открыт у нас: просим полную версию
+            self.network.send_sync_request()
+            return
+
+        # Активная вкладка: пауза набора не мешает, фрагмент маленький
+        if not self.editor.apply_remote_delta(pos, removed, insert, base_digest):
+            self.statusBar().showMessage("Расхождение версий, запрашиваю полную синхронизацию...", 3000)
+            self.network.send_sync_request()
+            return
+
+        self._suppress_code_echo = True
+        try:
+            self.editor.flush_deferred_remote_update()
+        finally:
+            self._suppress_code_echo = False
+        self.tabs[matched_idx]["content"] = self.editor.toPlainText()
 
     def flush_pending_sync(self):
         """Немедленная отправка накопленных правок (перед сменой вкладки)."""
@@ -1693,6 +1832,9 @@ class MainWindow(QMainWindow):
 
     def on_remote_code_received(self, code: str, file_name: str = ""):
         """Применение кода от напарника с привязкой к вкладке/файлу."""
+        # Полный снапшот завершает выравнивание: дальше снова можно
+        # пользоваться быстрыми фрагментами
+        self._sync_pending = False
         if not file_name or not self.tabs:
             self.editor.apply_remote_code(code, defer_on_conflict=True)
             self.editor.flush_deferred_remote_update()
