@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout
 )
 
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.5"
 GITHUB_OWNER = "famouSSeX"
 GITHUB_REPO = "DuoPy"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -243,32 +243,39 @@ def install_update(new_exe_path: str) -> tuple[bool, str]:
     log_path = os.path.join(work_dir, "update.log")
     # Текст скрипта только латиницей: cmd.exe читает .cmd в OEM-кодировке,
     # поэтому кириллица в журнале установки превращалась бы в мусор.
+    #
+    # Ожидание построено на доступности ФАЙЛА, а не на завершении процесса:
+    # в onefile-сборке PyInstaller работают два процесса (загрузчик и дочерний
+    # с Python), и EXE остаётся заблокированным родительским загрузчиком ещё
+    # некоторое время после выхода приложения. Проверка по PID в этом случае
+    # проходила неверно, и файл не подменялся.
     script = f"""@echo off
-rem DuoPy update installer: waits for the app to exit, replaces the EXE, starts it.
-rem The process check uses PowerShell: tasklist may answer "Access denied" in
-rem restricted environments, which made the wait loop finish prematurely.
 setlocal
 set "NEW={new_exe_path}"
 set "CUR={current_exe}"
 set "LOG={log_path}"
-set "PID={os.getpid()}"
 echo [%DATE% %TIME%] update started >> "%LOG%"
 set /a TRIES=0
 :wait
-powershell -NoProfile -Command "if (Get-Process -Id %PID% -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-if not errorlevel 1 (
+rem Файл готов к замене, когда его можно открыть на запись
+powershell -NoProfile -Command "try {{ [IO.File]::Open('{current_exe}','Open','Write','None').Close(); exit 0 }} catch {{ exit 1 }}" >nul 2>&1
+if errorlevel 1 (
     set /a TRIES+=1
-    if %TRIES% GEQ 240 (
-        echo [%DATE% %TIME%] timeout: DuoPy still running, update cancelled >> "%LOG%"
+    if %TRIES% GEQ 300 (
+        echo [%DATE% %TIME%] timeout: file still locked, update cancelled >> "%LOG%"
         goto :end
     )
-    timeout /t 1 /nobreak >nul
+    ping -n 2 127.0.0.1 >nul
     goto wait
 )
-echo [%DATE% %TIME%] app closed, copying new build >> "%LOG%"
+echo [%DATE% %TIME%] file released, copying new build >> "%LOG%"
 copy /y "%NEW%" "%CUR%" >> "%LOG%" 2>&1
 if errorlevel 1 (
-    echo [%DATE% %TIME%] failed to replace the executable >> "%LOG%"
+    rem Заменить не удалось: чаще всего папка защищена (Program Files) и нужны
+    rem права администратора. Возвращаем прежнюю версию, чтобы приложение
+    rem не осталось нерабочим.
+    echo [%DATE% %TIME%] failed to replace the executable, restarting current build >> "%LOG%"
+    start "" "%CUR%"
     goto :end
 )
 echo [%DATE% %TIME%] starting the new version >> "%LOG%"
@@ -287,8 +294,9 @@ endlocal
     except Exception as e:
         return False, f"Не удалось запустить установщик обновления: {e}"
 
-    return True, ("Обновление готово к установке. Закройте DuoPy — новая версия "
-                  "запустится автоматически.")
+    return True, ("Обновление скачано и готово к установке.\n\n"
+                  "DuoPy сейчас закроется, файл будет заменён, и приложение "
+                  "запустится заново — уже новой версии.")
 
 
 class ConnectionStatsDialog(QDialog):
@@ -363,9 +371,20 @@ class ConnectionStatsDialog(QDialog):
             self.lbl_history.setText("")
             return
 
-        mode = "облачная комната " + (net.room_code or "") if net.mode == "cloud" \
+        mode = f"облачная комната {net.room_code or ''}".strip() if net.mode == "cloud" \
             else "прямое подключение (LAN/IP)"
-        transport = "шифрованный канал" if net.mode == "cloud" else "локальная сеть"
+
+        # В облачной комнате трафик идёт через публичный брокер, пока не удалось
+        # пробить NAT. Когда прямой канал установлен, обмен идёт напрямую —
+        # это заметно быстрее, поэтому режим показываем явно.
+        if net.mode == "cloud":
+            if getattr(net, "transport", "relay") == "p2p":
+                peer = net.p2p.peer_sockaddr if net.p2p else None
+                transport = "напрямую с напарником" + (f" ({peer[0]}:{peer[1]})" if peer else "")
+            else:
+                transport = "через сервер комнат (посредник)"
+        else:
+            transport = "локальная сеть"
         self.lbl_mode.setText(f"Режим: {mode} · {transport}")
 
         latency = net.latency_ms
