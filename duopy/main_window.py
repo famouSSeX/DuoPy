@@ -36,7 +36,7 @@ from duopy.styles import DARK_THEME_QSS
 from duopy.config import (
     get_user_profile, set_user_profile, PRESET_COLORS, add_recent_room, get_recent_rooms
 )
-from duopy.updater import AboutAndUpdatesDialog, APP_VERSION
+from duopy.updater import AboutAndUpdatesDialog, ConnectionStatsDialog, APP_VERSION
 
 
 def resolve_inside(path: str, base_dir: str) -> str | None:
@@ -453,6 +453,13 @@ class MainWindow(QMainWindow):
         self.cursor_sync_timer.setSingleShot(True)
         self.cursor_sync_timer.timeout.connect(self._flush_cursor_update)
         self.pending_cursor_data = None
+
+        # Измерение качества связи: раз в секунду пересчитываем скорости,
+        # раз в две секунды отправляем ping для замера задержки
+        self._metrics_tick = 0
+        self.metrics_timer = QTimer(self)
+        self.metrics_timer.setInterval(1000)
+        self.metrics_timer.timeout.connect(self.on_metrics_tick)
 
         # Подавление обратной отправки RUN_CODE при подтверждении запроса напарника
         self._suppress_remote_run_echo = False
@@ -906,6 +913,18 @@ class MainWindow(QMainWindow):
         self.lbl_sb_indent.setStyleSheet("margin-right: 8px; color: #ffffff;")
         status_bar.addPermanentWidget(self.lbl_sb_indent)
 
+        # Индикатор скорости соединения: задержка и скорость передачи текста.
+        # По клику открывается подробное окно замеров.
+        self.lbl_sb_speed = QLabel("📶 нет связи")
+        self.lbl_sb_speed.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_sb_speed.setStyleSheet("margin-right: 10px; color: #d0d0d0;")
+        self.lbl_sb_speed.setToolTip(
+            "Скорость соединения с напарником: задержка (пинг) и объём текста в секунду.\n"
+            "Нажмите, чтобы открыть подробные замеры."
+        )
+        self.lbl_sb_speed.mousePressEvent = lambda _e: self.on_show_connection_stats()
+        status_bar.addPermanentWidget(self.lbl_sb_speed)
+
         # Горячие клавиши
         act_run = QAction("Запуск", self)
         act_run.setShortcut(QKeySequence("F5"))
@@ -970,6 +989,7 @@ class MainWindow(QMainWindow):
         self.network.sync_requested_signal.connect(self.on_sync_requested)
         self.network.stdin_received.connect(self.on_remote_stdin_received)
         self.network.project_tree_received.connect(self.on_remote_project_tree_received)
+        self.network.metrics_updated.connect(self.on_metrics_updated)
         self.network.file_content_requested.connect(self.on_remote_file_content_requested)
         self.network.file_content_received.connect(self.on_remote_file_content_received)
         self.network.file_create_requested.connect(self.on_remote_file_create_requested)
@@ -1305,6 +1325,8 @@ class MainWindow(QMainWindow):
             """)
             self.statusBar().setStyleSheet("background-color: #0d4429; color: #ffffff;")
             self._update_peers_list()
+            # Замеры качества связи начинаем сразу после запуска сессии
+            self._start_metrics()
 
     def on_join_cloud_room(self):
         """Вход в комнату по коду."""
@@ -1338,6 +1360,8 @@ class MainWindow(QMainWindow):
             """)
             self.statusBar().setStyleSheet("background-color: #4a2800; color: #ffffff;")
             self._update_peers_list()
+            # Замеры качества связи начинаем сразу после запуска сессии
+            self._start_metrics()
 
     def on_lan_dialog(self):
         """Локальное подключение по IP."""
@@ -1360,6 +1384,8 @@ class MainWindow(QMainWindow):
                 self.lbl_room_badge.setText(badge_text)
                 self.lbl_toolbar_badge.setText(f"🟠 {badge_text}")
             self._update_peers_list()
+            # Замеры качества связи начинаем сразу после запуска сессии
+            self._start_metrics()
 
     def _set_session_active(self, active: bool):
         self.btn_create_room.setEnabled(not active)
@@ -1398,6 +1424,7 @@ class MainWindow(QMainWindow):
         self._refresh_project_tree()
 
         self.statusBar().showMessage("Сессия завершена. Режим: Одиночный")
+        self._stop_metrics()
 
     def on_peer_connected(self, peer_name: str, source: str):
         is_reconnect = (self.peer_name == peer_name)
@@ -1434,6 +1461,7 @@ class MainWindow(QMainWindow):
         self.append_chat_system(f"Напарник вышел: {reason}")
         self.peer_name = "Ожидание..."
         self._clear_peer_editor_state()
+        self._stop_metrics()
         self._update_peers_list()
         self.statusBar().showMessage(f"🔴 {reason}")
 
@@ -1466,7 +1494,7 @@ class MainWindow(QMainWindow):
 
     def on_show_updates(self):
         """Проверка обновлений и информация о версии."""
-        self._updates_dialog = AboutAndUpdatesDialog(self)
+        self._updates_dialog = AboutAndUpdatesDialog(self, network=self.network)
         self._updates_dialog.exec()
         self._updates_dialog = None
 
@@ -1479,7 +1507,7 @@ class MainWindow(QMainWindow):
         """
         if getattr(sys, "_running_tests", False):
             return
-        self._updates_dialog = AboutAndUpdatesDialog(self, silent=True)
+        self._updates_dialog = AboutAndUpdatesDialog(self, silent=True, network=self.network)
         self._updates_dialog.check_updates()
 
     def on_peer_file_changed(self, peer_name: str, file_name: str):
@@ -1497,7 +1525,10 @@ class MainWindow(QMainWindow):
         self.peers_list.addItem(QListWidgetItem(f"🟢 {self.user_name} (Вы)"))
         if self.network.is_connected and self.peer_name != "Ожидание...":
             suffix = f" [{peer_active_file}]" if peer_active_file else ""
-            self.peers_list.addItem(QListWidgetItem(f"🟢 {self.peer_name}{suffix}"))
+            # Задержку показываем рядом с именем напарника в списке участников
+            latency = self.network.latency_ms
+            ping = f" · {latency:.0f} мс" if latency > 0 else ""
+            self.peers_list.addItem(QListWidgetItem(f"🟢 {self.peer_name}{ping}{suffix}"))
         elif self.network.running:
             item_wait = QListWidgetItem("⏳ Ожидание напарника...")
             item_wait.setForeground(QColor("#858585"))
@@ -1511,6 +1542,82 @@ class MainWindow(QMainWindow):
 
     def _session_alive(self) -> bool:
         return bool(self.network.is_connected or self.network.running)
+
+    # ------------------ Скорость соединения (пинг и трафик) ------------------
+    def on_metrics_tick(self):
+        """Периодический опрос: пересчёт скоростей и отправка ping."""
+        if not self.network.is_connected:
+            # Соединение ещё устанавливается или уже потеряно — показываем статус
+            self._update_speed_label()
+            return
+        self.network.update_rates()
+        # Замер задержки раз в две секунды: чаще нет смысла, реже — теряется
+        # динамика при ухудшении связи
+        self._metrics_tick += 1
+        if self._metrics_tick % 2 == 0:
+            self.network.send_ping()
+        self._update_speed_label()
+
+    def _start_metrics(self):
+        """Запуск измерений при подключении."""
+        self.network.reset_metrics()
+        self._metrics_tick = 0
+        if not self.metrics_timer.isActive():
+            self.metrics_timer.start()
+        self._update_speed_label()
+
+    def _stop_metrics(self):
+        """Остановка измерений и сброс индикатора."""
+        self.metrics_timer.stop()
+        self.lbl_sb_speed.setText("📶 нет связи")
+        self.lbl_sb_speed.setStyleSheet("margin-right: 10px; color: #d0d0d0;")
+        self.lbl_sb_speed.setToolTip("Соединение не активно")
+
+    def on_metrics_updated(self, latency_ms: float, rate_in: float, rate_out: float):
+        """Обновление индикатора скорости в статус-баре."""
+        self._update_speed_label()
+
+    def _update_speed_label(self):
+        latency = self.network.latency_ms
+        rate = (self.network.rate_in_bps + self.network.rate_out_bps) / 1024.0
+        # «0 мс» — это не отсутствие замера, а честный результат на быстром
+        # канале (localhost): показываем его как «<1 мс»
+        measured = bool(self.network.latency_samples)
+
+        if not self.network.is_connected:
+            text, color = "📶 нет связи", "#d0d0d0"
+        elif not measured:
+            text, color = "📶 …", "#d0d0d0"
+        else:
+            if latency < 60:
+                icon, color = "🟢", "#7ee787"
+            elif latency < 150:
+                icon, color = "🟢", "#4ec9b0"
+            elif latency < 400:
+                icon, color = "🟡", "#e5c07b"
+            else:
+                icon, color = "🔴", "#f48771"
+            shown = f"{latency:.0f} мс" if latency >= 1 else "<1 мс"
+            text = f"{icon} {shown} · {rate:.1f} КБ/с"
+
+        self.lbl_sb_speed.setText(text)
+        self.lbl_sb_speed.setStyleSheet(f"margin-right: 10px; color: {color};")
+        avg = self.network.latency_avg_ms
+        avg_text = f"{avg:.0f}" if avg >= 1 else "<1"
+        self.lbl_sb_speed.setToolTip(
+            f"Задержка: {latency:.0f} мс (средняя {avg_text} мс)\n"
+            f"Приём текста: {self.network.rate_in_bps / 1024:.1f} КБ/с\n"
+            f"Отправка текста: {self.network.rate_out_bps / 1024:.1f} КБ/с\n"
+            f"Пиковая скорость: {self.network.throughput_peak_bps / 1024:.1f} КБ/с\n"
+            f"За сессию: ↑ {self.network.bytes_out / 1024:.1f} КБ · "
+            f"↓ {self.network.bytes_in / 1024:.1f} КБ\n"
+            "Нажмите для подробных замеров."
+        )
+
+    def on_show_connection_stats(self):
+        """Окно с подробной статистикой соединения."""
+        dialog = ConnectionStatsDialog(self.network, self)
+        dialog.exec()
 
     def on_local_code_changed(self, new_code: str):
         if 0 <= self.current_tab_index < len(self.tabs):
