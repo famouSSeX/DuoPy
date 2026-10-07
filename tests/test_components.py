@@ -607,13 +607,13 @@ class TestSecurityAndDataIntegrity(unittest.TestCase):
         self.assertEqual(win.tabs[1]["content"], "REMOTE V2")
         self.assertEqual(win.tabs[0]["content"], "LOCAL CONTENT")
 
-    def test_incoming_update_defers_instead_of_clobbering_typing(self):
+    def test_incoming_update_defers_only_while_typing(self):
         """
-        Входящее обновление не стирает текст, который пользователь набирает.
+        Входящая правка откладывается, только пока пользователь печатает,
+        и применяется сама после паузы.
 
-        Сценарий: каретка стоит на числе, которое напарник одновременно меняет.
-        Правка напарника входит в область локального набора, поэтому она
-        откладывается, а не затирает набранное молча.
+        Раньше она ждала ухода напарника со строки и не применялась никогда —
+        из-за этого каждый видел только свой текст и стороны расходились.
         """
         editor = CodeEditor()
         editor.setPlainText("x = 1\n")
@@ -621,29 +621,106 @@ class TestSecurityAndDataIntegrity(unittest.TestCase):
         cursor.setPosition(4)                     # каретка сразу после 'x = '
         editor.setTextCursor(cursor)
 
+        # Пользователь только что набрал символ, то есть сейчас печатает
+        editor._typing_timer.start(900)
         applied = editor.apply_remote_code("x = 9999\n", defer_on_conflict=True)
-        self.assertFalse(applied, "правка в области набора должна откладываться")
+        self.assertFalse(applied, "во время набора правка должна откладываться")
         self.assertEqual(editor.toPlainText(), "x = 1\n", "локальный текст не должен меняться")
-        self.assertIsNotNone(editor._deferred_remote_update, "обновление сохранено в очереди")
+        self.assertIsNotNone(editor._deferred_remote_update)
 
-        # Когда напарник уходит, отложенное обновление применяется
-        editor.remove_remote_cursor("u1")
+        # По паузе отложенная правка применяется сама
+        editor.flush_deferred_remote_update()
         self.assertEqual(editor.toPlainText(), "x = 9999\n")
         self.assertIsNone(editor._deferred_remote_update)
         editor.close()
 
-    def test_incoming_update_outside_typing_area_applies(self):
-        """Правка напарника вне области набора применяется сразу (и не теряется)."""
+    def test_incoming_update_applies_when_not_typing(self):
+        """Если пользователь не печатает, правка напарника применяется сразу."""
         editor = CodeEditor()
-        editor.setPlainText("line one\nline two\n")
+        editor.setPlainText("x = 1\n")
         cursor = editor.textCursor()
-        cursor.setPosition(len("line one\nline "))
+        cursor.setPosition(4)
         editor.setTextCursor(cursor)
+        # setPlainText сам считается активностью (защита недавней вставки),
+        # поэтому для сценария «пользователь бездействует» останавливаем таймер.
+        editor._typing_timer.stop()
+        self.assertFalse(editor._typing_timer.isActive())
 
-        applied = editor.apply_remote_code("line one CHANGED\nline two\n", defer_on_conflict=True)
-        self.assertTrue(applied)
-        self.assertEqual(editor.toPlainText(), "line one CHANGED\nline two\n")
+        applied = editor.apply_remote_code("x = 9999\n", defer_on_conflict=True)
+        self.assertTrue(applied, "без активного набора откладывать нечего")
+        self.assertEqual(editor.toPlainText(), "x = 9999\n")
+        self.assertIsNone(editor._deferred_remote_update)
         editor.close()
+
+    def test_two_peers_typing_in_same_place_converge(self):
+        """
+        Главный сценарий: оба печатают в одном и том же месте файла.
+
+        Текст обязан совпасть у обоих, а отложенные правки — не зависнуть.
+        Прежняя версия оставляла у сторон разный текст навсегда.
+        """
+        import time as _time
+        from duopy.main_window import MainWindow
+
+        port = 9961
+        host = MainWindow()
+        guest = MainWindow()
+        self.created.append(host)
+        self.created.append(guest)
+
+        host.network.start_host(port)
+        for _ in range(25):
+            app.processEvents()
+            _time.sleep(0.02)
+
+        try:
+            guest.network.connect_to_host("127.0.0.1", port)
+            for _ in range(80):
+                app.processEvents()
+                if host.network.is_connected and guest.network.is_connected:
+                    break
+                _time.sleep(0.03)
+            self.assertTrue(host.network.is_connected and guest.network.is_connected,
+                            "два окна должны соединиться")
+
+            def pump(seconds):
+                end = _time.time() + seconds
+                while _time.time() < end:
+                    app.processEvents()
+                    _time.sleep(0.02)
+
+            def type_in(win, text):
+                win.editor.load_text_programmatically(text)
+                cur = win.editor.textCursor()
+                cur.setPosition(max(0, win.editor.document().characterCount() - 1))
+                win.editor.setTextCursor(cur)
+                win.editor.code_changed_by_user.emit(text)
+                app.processEvents()
+
+            type_in(host, "count = ")
+            type_in(guest, "count = ")
+            pump(1.0)
+
+            # Оба «печатают» в одну строку, каретка каждого в области правки
+            for i in range(1, 4):
+                type_in(host, f"count = {i}")
+                pump(0.3)
+                type_in(guest, guest.editor.toPlainText() + "x")
+                pump(0.3)
+
+            pump(4.0)   # ждём применения отложенных правок
+
+            host_text = host.editor.toPlainText()
+            guest_text = guest.editor.toPlainText()
+            self.assertEqual(host_text, guest_text,
+                             f"текст должен совпасть у обоих: {host_text!r} != {guest_text!r}")
+            self.assertIsNone(host.editor._deferred_remote_update,
+                              "у хоста не должно остаться зависшей правки")
+            self.assertIsNone(guest.editor._deferred_remote_update,
+                              "у гостя не должно остаться зависшей правки")
+        finally:
+            host.network.stop()
+            guest.network.stop()
 
     def test_replace_all_is_literal_and_undoable(self):
         """«Заменить все» вставляет текст буквально и отменяется через Undo."""
