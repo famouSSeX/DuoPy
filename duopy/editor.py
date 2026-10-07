@@ -13,6 +13,7 @@
 
 import re
 import time
+import hashlib
 from PyQt6.QtWidgets import QPlainTextEdit, QWidget, QTextEdit, QCompleter, QToolTip
 from PyQt6.QtGui import (
     QColor, QPainter, QTextFormat, QTextCursor, QTextCharFormat, QFont,
@@ -74,6 +75,8 @@ class CodeEditor(QPlainTextEdit):
     cursor_position_changed = pyqtSignal(int, int, int, int, int)  # line, col, pos, sel_start, sel_end
     linter_issues_changed = pyqtSignal(list)                       # list[LinterIssue]
     line_locked_warning = pyqtSignal(int, str)                     # line_number, peer_name
+    # Не удалось слить чужую правку со своими изменениями: нужна полная синхронизация
+    divergence_detected = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -133,6 +136,13 @@ class CodeEditor(QPlainTextEdit):
 
         # Отложенное обновление от напарника (чтобы не затирать набор)
         self._deferred_remote_update: dict | None = None
+        # Две базы, и путать их нельзя:
+        #  _peer_digest — метка текста, который сейчас у напарника (её он сверит)
+        #  _sent_text   — текст, который мы отправили последним (от него считаем фрагмент)
+        #  _peer_text   — тот же текст для справки в отладке
+        self._peer_text: str = ""
+        self._sent_text: str = ""
+        self._peer_digest: str = ""
         # Подавление сетевых сигналов при программной загрузке текста
         self._loading_programmatically = False
         # Совпадения поиска недействительны после правки текста
@@ -689,6 +699,7 @@ class CodeEditor(QPlainTextEdit):
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.Start)
             self.setTextCursor(cursor)
+            self.mark_synced(text)
             self.highlight_current_line()
             return
         self._loading_programmatically = True
@@ -696,6 +707,9 @@ class CodeEditor(QPlainTextEdit):
             self._replace_whole_document(text)
         finally:
             self._loading_programmatically = False
+        # Загруженный текст считаем согласованным с напарником: иначе первая
+        # же правка отправила бы весь файл вместо изменённого фрагмента.
+        self.mark_synced(text)
         # Курсор в начало, подсветка и линтер — как после обычного открытия файла
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
@@ -911,6 +925,167 @@ class CodeEditor(QPlainTextEdit):
     def _ranges_overlap(self, a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
         return a_start < b_end and b_start < a_end
 
+    @staticmethod
+    def compute_edit(old_text: str, new_text: str) -> tuple[int, int, str]:
+        """
+        Минимальная правка между двумя версиями текста.
+
+        Возвращает (позиция, сколько символов заменяется, новый фрагмент).
+        Нужна, чтобы отправлять напарнику только изменённый фрагмент, а не
+        весь файл: на публичном брокере передача всего файла на каждое
+        нажатие давала задержку в секунды на файлах от десятков килобайт.
+        """
+        if old_text == new_text:
+            return (0, 0, "")
+
+        prefix = 0
+        min_len = min(len(old_text), len(new_text))
+        while prefix < min_len and old_text[prefix] == new_text[prefix]:
+            prefix += 1
+
+        # Суффикс не должен перекрывать уже найденный префикс
+        suffix = 0
+        limit = min_len - prefix
+        while (suffix < limit and
+               old_text[len(old_text) - 1 - suffix] == new_text[len(new_text) - 1 - suffix]):
+            suffix += 1
+
+        old_end = len(old_text) - suffix
+        new_end = len(new_text) - suffix
+        return (prefix, old_end - prefix, new_text[prefix:new_end])
+
+    def capture_send_delta(self) -> tuple[int, int, str, str]:
+        """
+        Правка, накопившаяся с момента последней отправки.
+
+        Позиции считаем от последнего отправленного текста, а метку версии
+        берём у текста, который сейчас у напарника (_peer_digest). Именно её он
+        сверит со своим состоянием, и она же после применения его обновления
+        становится меткой нашего нового текста — поэтому цепочка правок
+        продолжается без лишних полных пересылок.
+        """
+        current = self.toPlainText()
+        if current == self._sent_text and self._peer_digest:
+            return (0, 0, "", self._peer_digest)
+
+        delta = self.compute_edit(self._sent_text, current)
+        self._sent_text = current
+        return (delta[0], delta[1], delta[2], self._peer_digest or self.text_digest())
+
+    def mark_synced(self, text: str | None = None):
+        """
+        Зафиксировать текст как согласованный с напарником.
+
+        Проставляется после полной синхронизации: у сторон одинаковый текст,
+        поэтому все базы и метки выравниваются по нему.
+        """
+        snapshot = self.toPlainText() if text is None else text
+        self._peer_text = self._sent_text = snapshot
+        self._peer_digest = hashlib.blake2b(snapshot.encode("utf-8", "surrogatepass"),
+                                            digest_size=8).hexdigest()
+
+    def text_digest(self) -> str:
+        """Короткая метка текущего текста (для сверки версий)."""
+        data = self.toPlainText().encode("utf-8", "surrogatepass")
+        return hashlib.blake2b(data, digest_size=8).hexdigest()
+
+    def apply_remote_delta(self, pos: int, removed: int, insert: str, base_digest: str = "") -> bool:
+        """
+        Применение правки напарника без пересылки всего файла.
+
+        Позиции заданы в координатах текста, который напарник считает нашим
+        (base_digest — его метка). Если он не совпадает с тем, что мы ему
+        отправили, правка основана на устаревшем состоянии: применяем её со
+        сдвигом, а если области накладываются — сообщаем о расхождении.
+        """
+        current = self.toPlainText()
+        source = self._sent_text if self._sent_text else current
+
+        if base_digest and base_digest != self._sent_text_digest():
+            # Напарник правил версию, которой у нас уже нет: сдвинуть позиции
+            # корректно невозможно
+            self.divergence_detected.emit()
+            return False
+
+        # Позиция ограничивается ТЕКУЩИМ документом, а не базовым: у нас уже
+        # могут быть применены предыдущие правки, и документ длиннее.
+        # Ограничение по базе откатывало вставку в старое место, из-за чего
+        # символы вставали в обратном порядке.
+        pos = max(0, min(pos, len(current)))
+        removed = max(0, min(removed, len(current) - pos))
+
+        if current != source:
+            # Мы печатали после отправки: сдвигаем позицию чужой правки
+            my_start, my_removed, my_insert = self.compute_edit(source, current)
+            my_end = my_start + len(my_insert)
+            their_start, their_end = pos, pos + removed
+
+            if not (their_end <= my_start or their_start >= my_end):
+                # Области накладываются: без общей истории слить нельзя
+                self.divergence_detected.emit()
+                return False
+
+            if my_end <= their_start:
+                pos = max(0, min(their_start + (len(my_insert) - my_removed), len(current)))
+
+        return self._write_delta(pos, removed, insert, current)
+
+    def _sent_text_digest(self) -> str:
+        """Метка последнего отправленного текста (то, что напарник должен иметь)."""
+        return hashlib.blake2b(self._sent_text.encode("utf-8", "surrogatepass"),
+                               digest_size=8).hexdigest()
+
+    def _write_delta(self, pos: int, removed: int, insert: str, expected_current: str) -> bool:
+        """Применение подготовленной правки к документу."""
+        cursor = self.textCursor()
+        old_pos = cursor.position()
+        old_anchor = cursor.anchor()
+        had_selection = cursor.hasSelection()
+
+        self.is_applying_remote_update = True
+        try:
+            edit_cursor = QTextCursor(self.document())
+            edit_cursor.beginEditBlock()
+            edit_cursor.setPosition(max(0, min(pos, len(expected_current))))
+            if removed:
+                edit_cursor.setPosition(
+                    max(0, min(pos + removed, len(expected_current))),
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+            edit_cursor.insertText(insert)
+            edit_cursor.endEditBlock()
+
+            delta = len(insert) - removed
+
+            def shift(value: int) -> int:
+                if value <= pos:
+                    return value
+                if value >= pos + removed:
+                    return max(0, min(value + delta, self.document().characterCount() - 1))
+                return pos + len(insert)
+
+            new_cursor = self.textCursor()
+            new_cursor.setPosition(shift(old_anchor))
+            if had_selection and shift(old_anchor) != shift(old_pos):
+                new_cursor.setPosition(shift(old_pos), QTextCursor.MoveMode.KeepAnchor)
+            else:
+                new_cursor.setPosition(shift(old_pos))
+            self.setTextCursor(new_cursor)
+        finally:
+            self.is_applying_remote_update = False
+            self._typing_timer.stop()
+            # После применения правки у нас с напарником одинаковый текст,
+            # поэтому метка его версии равна метке текущего текста — цепочка
+            # правок продолжается без полных пересылок
+            result = self.toPlainText()
+            self._peer_text = result
+            self._peer_digest = hashlib.blake2b(result.encode("utf-8", "surrogatepass"),
+                                                digest_size=8).hexdigest()
+            self.highlight_current_line()
+            self.lint_timer.start(350)
+            self.viewport().update()
+        return True
+
     def apply_remote_code(self, new_text: str, defer_on_conflict: bool = False) -> bool:
         """
         Применение кода от напарника дифференциально, без мерцания и с сохранением позиции курсора.
@@ -1004,6 +1179,9 @@ class CodeEditor(QPlainTextEdit):
             # Наша собственная применённая правка — не «набор пользователя»:
             # иначе следующие 0.9 с правки напарника снова откладывались бы.
             self._typing_timer.stop()
+            # Полный снапшот от напарника: у сторон одинаковый текст, метки
+            # выравниваются по нему
+            self.mark_synced(self.toPlainText())
             self.highlight_current_line()
             # Линтер гоняем через тот же debounce-таймер, а не синхронно: напарник
             # шлёт апдейты каждые ~120 мс, и полный ast.parse блокировал GUI.
