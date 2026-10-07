@@ -10,6 +10,8 @@ import json
 import threading
 import time
 import random
+import zlib
+import base64
 from datetime import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -31,6 +33,9 @@ DEFAULT_RELAY_BROKERS = [
 # Максимальный размер одного кадра TCP-протокола (защита от зависания на
 # некорректной или враждебной длине кадра)
 MAX_FRAME_BYTES = 32 * 1024 * 1024
+
+# С какого размера сжимать сообщение: мелкие пакеты дешевле отправить как есть
+COMPRESS_THRESHOLD_BYTES = 2048
 
 
 def get_local_ip() -> str:
@@ -83,6 +88,11 @@ class NetworkManager(QObject):
     file_save_requested = pyqtSignal(str, str)          # (rel_path, content)
     # Качество связи: (задержка в мс, КБ/с входящие, КБ/с исходящие)
     metrics_updated = pyqtSignal(float, float, float)
+    # Правка фрагментом: (позиция, сколько символов заменяется, новый фрагмент,
+    # имя файла, метка версии текста, на которой основана правка)
+    code_edit_received = pyqtSignal(int, int, str, str, str)
+    # Пропущен номер правки — часть изменений потерялась в сети
+    edit_loss_detected = pyqtSignal()
 
     def __init__(self, username="Разработчик", user_color="#4ec9b0", parent=None):
         super().__init__(parent)
@@ -105,6 +115,9 @@ class NetworkManager(QObject):
         self._ping_sent_at = 0.0
         self._ping_pending = False
         self._ping_seq = 0
+        # Номера правок: свои для отправки, чужие — для контроля потерь
+        self._edit_seq = 0
+        self._peer_edit_seq = 0
 
         # Режимы сети: "cloud" или "tcp"
         self.mode: str | None = None
@@ -253,10 +266,14 @@ class NetworkManager(QObject):
         data["sender_id"] = self.user_id
         topic = f"duopy/v1/rooms/{self.room_code}"
 
-        # Для курсора и потокового текста используем QoS 0,
-        # чтобы избежать переполнения очереди broker'а и ложных разрывов связи
+        # Для курсора и правок текста используем QoS 0: доставка без
+        # подтверждения. С QoS 1 брокер подтверждает каждое сообщение, то есть
+        # добавляет полный круг задержки (~300 мс на публичном брокере) к
+        # каждому нажатию, а набор становился «вязким». Правка несёт метку
+        # версии, поэтому потерянный фрагмент безопасен: следующий фрагмент
+        # или полная синхронизация восстановят состояние.
         msg_type = data.get("type")
-        qos = 0 if msg_type in ("CURSOR_MOVE", "CODE_UPDATE") else 1
+        qos = 0 if msg_type in ("CURSOR_MOVE", "CODE_UPDATE", "CODE_EDIT") else 1
 
         try:
             raw = json.dumps(data)
@@ -581,6 +598,8 @@ class NetworkManager(QObject):
 
     def _dispatch_message(self, msg: dict):
         """Маршрутизация сообщений (для обоих режимов: Cloud и TCP)."""
+        if msg.get("type") == "PACKED":
+            msg = self._unpack(msg)
         msg_type = msg.get("type")
 
         if msg_type in ("HANDSHAKE", "JOIN"):
@@ -619,6 +638,28 @@ class NetworkManager(QObject):
             fname = msg.get("file", "")
             self.text_received.emit(code)
             self.file_code_received.emit(code, fname)
+
+        elif msg_type == "CODE_EDIT":
+            # Правка фрагментом: позиция, сколько удалить, что вставить, метка
+            # версии и номер правки (по нему ловится потеря пакета)
+            pos = msg.get("pos", 0)
+            removed = msg.get("removed", 0)
+            insert = msg.get("insert", "")
+            fname = msg.get("file", "")
+            base = msg.get("base", "")
+            seq = int(msg.get("seq", 0) or 0)
+
+            # Правки идут без подтверждения доставки (QoS 0) ради скорости,
+            # поэтому пропуск номера означает потерю: сообщаем наверх, чтобы
+            # стороны выровнялись полной синхронизацией
+            if seq and self._peer_edit_seq and seq != self._peer_edit_seq + 1:
+                print(f"[DuoPy] Потеряна правка (было {self._peer_edit_seq}, пришло {seq})")
+                self.edit_loss_detected.emit()
+                return
+            if seq:
+                self._peer_edit_seq = seq
+
+            self.code_edit_received.emit(int(pos), int(removed), insert, fname, base)
 
         elif msg_type == "CURSOR_MOVE":
             uid = msg.get("sender_id", "")
@@ -718,6 +759,62 @@ class NetworkManager(QObject):
     # Публичные методы отправки
     def send_code_update(self, code: str, file_name: str = ""):
         self._broadcast({"type": "CODE_UPDATE", "code": code, "file": file_name})
+
+    def send_code_delta(self, pos: int, removed: int, insert: str,
+                        file_name: str = "", base_digest: str = ""):
+        """
+        Отправка только изменённого фрагмента.
+
+        Полный текст передавать на каждое нажатие слишком дорого: через
+        публичный брокер файл в 100 КБ доставлялся около двух секунд. Здесь
+        уходит лишь фрагмент (и он сжимается, если получился большим).
+        base_digest — метка версии текста, на которой основана правка.
+        seq — номер правки: по нему получатель замечает потерю.
+        """
+        self._edit_seq += 1
+        payload = {
+            "type": "CODE_EDIT",
+            "file": file_name,
+            "pos": pos,
+            "removed": removed,
+            "insert": insert,
+            "base": base_digest,
+            "seq": self._edit_seq,
+        }
+        compressed = self._maybe_compress(payload)
+        self._broadcast(compressed)
+
+    @staticmethod
+    def _maybe_compress(payload: dict) -> dict:
+        """
+        Сжатие крупных сообщений.
+
+        zlib для исходного кода даёт выигрыш в разы (повторяющиеся отступы,
+        имена, ключевые слова), а на медленном канале это прямая экономия
+        времени доставки. Мелкие сообщения не трогаем: заголовок съест выигрыш.
+        """
+        raw = json.dumps(payload, separators=(",", ":"))
+        if len(raw) < COMPRESS_THRESHOLD_BYTES:
+            return payload
+        try:
+            packed = zlib.compress(raw.encode("utf-8"), 6)
+            if len(packed) >= len(raw) * 0.9:
+                return payload
+            return {"type": "PACKED", "data": base64.b64encode(packed).decode("ascii")}
+        except Exception:
+            return payload
+
+    @staticmethod
+    def _unpack(payload: dict) -> dict:
+        """Распаковка сжатого сообщения (обратная сторона _maybe_compress)."""
+        if payload.get("type") != "PACKED":
+            return payload
+        try:
+            blob = base64.b64decode(payload.get("data", ""))
+            return json.loads(zlib.decompress(blob).decode("utf-8"))
+        except Exception as e:
+            print(f"[DuoPy] Не удалось распаковать сообщение: {e}")
+            return {"type": "_INVALID"}
 
     def send_project_tree(self, project_name: str, files: list[dict]):
         """Отправка структуры файлов проекта напарнику."""
