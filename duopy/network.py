@@ -81,12 +81,30 @@ class NetworkManager(QObject):
     file_create_requested = pyqtSignal(str)             # (rel_path)
     file_delete_requested = pyqtSignal(str)             # (rel_path)
     file_save_requested = pyqtSignal(str, str)          # (rel_path, content)
+    # Качество связи: (задержка в мс, КБ/с входящие, КБ/с исходящие)
+    metrics_updated = pyqtSignal(float, float, float)
 
     def __init__(self, username="Разработчик", user_color="#4ec9b0", parent=None):
         super().__init__(parent)
         self.username = username
         self.user_color = user_color
         self.user_id = f"usr_{int(time.time() * 1000)}_{random.randint(100, 999)}"
+
+        # Измерение качества связи
+        self.latency_ms = 0.0            # последняя измеренная задержка
+        self.latency_samples: list[float] = []   # скользящее окно для среднего
+        self.bytes_in = 0                # всего принято, байт
+        self.bytes_out = 0               # всего отправлено, байт
+        self.rate_in_bps = 0.0           # текущая скорость приёма, байт/с
+        self.rate_out_bps = 0.0          # текущая скорость отправки, байт/с
+        self.rtt_peak_ms = 0.0           # худшая задержка за сессию
+        self.throughput_peak_bps = 0.0   # пиковая скорость текста, байт/с
+        self._stats_prev_in = 0
+        self._stats_prev_out = 0
+        self._stats_prev_time = 0.0
+        self._ping_sent_at = 0.0
+        self._ping_pending = False
+        self._ping_seq = 0
 
         # Режимы сети: "cloud" или "tcp"
         self.mode: str | None = None
@@ -243,6 +261,8 @@ class NetworkManager(QObject):
         try:
             raw = json.dumps(data)
             self.mqtt_client.publish(topic, raw, qos=qos)
+            if msg_type not in ("PING", "PONG"):
+                self.bytes_out += len(raw.encode("utf-8"))
             return True
         except Exception as e:
             print(f"Ошибка отправки в MQTT: {e}")
@@ -423,6 +443,9 @@ class NetworkManager(QObject):
 
                 try:
                     payload = json.loads(payload_data.decode('utf-8'))
+                    # Служебные ping/pong в статистику скорости не входят
+                    if payload.get("type") not in ("PING", "PONG"):
+                        self.bytes_in += len(payload_data)
                     self._dispatch_message(payload)
                 except Exception as e:
                     print(f"Ошибка парсинга TCP: {e}")
@@ -447,9 +470,110 @@ class NetworkManager(QObject):
                 raw_json = json.dumps(data).encode('utf-8')
                 header = struct.pack('>I', len(raw_json))
                 self.peer_socket.sendall(header + raw_json)
+                if data.get("type") not in ("PING", "PONG"):
+                    self.bytes_out += len(raw_json)
             except Exception as e:
                 print(f"Ошибка отправки данных в TCP сокет: {e}")
                 self.is_connected = False
+
+    # =========================================================================
+    # КАЧЕСТВО СВЯЗИ: ЗАДЕРЖКА (PING) И СКОРОСТЬ ПЕРЕДАЧИ ТЕКСТА
+    # =========================================================================
+
+    def send_ping(self):
+        """
+        Отправка метки времени для измерения задержки связи.
+
+        Метка уходит напарнику и возвращается в PONG, поэтому в расчёт входит
+        именно круговое время (RTT), без зависимости от синхронизации часов.
+        """
+        if not self.is_connected:
+            return False
+        self._ping_seq += 1
+        self._ping_sent_at = time.time()
+        self._ping_pending = True
+        self._broadcast({"type": "PING", "ts": self._ping_sent_at, "seq": self._ping_seq})
+        return True
+
+    def _on_pong(self, msg: dict):
+        """Обработка ответа: считаем задержку и публикуем метрики."""
+        if not self._ping_pending:
+            return
+        try:
+            sent_at = float(msg.get("ts") or self._ping_sent_at)
+        except (TypeError, ValueError):
+            sent_at = self._ping_sent_at
+        rtt_ms = max(0.0, (time.time() - sent_at) * 1000.0)
+        self._ping_pending = False
+
+        self.latency_ms = rtt_ms
+        self.latency_samples.append(rtt_ms)
+        # Скользящее окно: последние 20 измерений — сглаживает выбросы
+        if len(self.latency_samples) > 20:
+            self.latency_samples.pop(0)
+        self.rtt_peak_ms = max(self.rtt_peak_ms, rtt_ms)
+
+    @property
+    def latency_avg_ms(self) -> float:
+        """Средняя задержка по последним измерениям."""
+        if not self.latency_samples:
+            return 0.0
+        return sum(self.latency_samples) / len(self.latency_samples)
+
+    def update_rates(self) -> tuple[float, float]:
+        """
+        Пересчёт текущих скоростей по счётчикам байтов.
+
+        Возвращает (КБ/с принято, КБ/с отправлено) и публикует метрики в UI.
+        """
+        now = time.time()
+        prev = self._stats_prev_time or now
+        # Окно замера не может быть короче 50 мс: иначе при двух опросах подряд
+        # знаменатель около нуля и скорость раздувается до бессмысленных величин.
+        elapsed = max(0.05, now - prev)
+        if now - prev < 0.05:
+            # Слишком частый опрос: не двигаем окно, иначе дельта «съедается»
+            self._stats_prev_time = prev
+        else:
+            self._stats_prev_time = now
+
+        delta_in = max(0, self.bytes_in - self._stats_prev_in)
+        delta_out = max(0, self.bytes_out - self._stats_prev_out)
+        self._stats_prev_in = self.bytes_in
+        self._stats_prev_out = self.bytes_out
+
+        # Сглаживание: без него скорость падала бы до нуля сразу после набора,
+        # и показатель «КБ/с» не успевал бы ничего показать. Затухание за
+        # секунду — примерно 40% от прежнего значения.
+        DECAY = 0.4
+        instant_in = delta_in / elapsed
+        instant_out = delta_out / elapsed
+        self.rate_in_bps = instant_in if instant_in > self.rate_in_bps else \
+            self.rate_in_bps * DECAY + instant_in * (1 - DECAY)
+        self.rate_out_bps = instant_out if instant_out > self.rate_out_bps else \
+            self.rate_out_bps * DECAY + instant_out * (1 - DECAY)
+        if self.rate_in_bps < 8:
+            self.rate_in_bps = 0.0
+        if self.rate_out_bps < 8:
+            self.rate_out_bps = 0.0
+
+        self.throughput_peak_bps = max(self.throughput_peak_bps,
+                                       self.rate_in_bps, self.rate_out_bps)
+        self.metrics_updated.emit(self.latency_ms, self.rate_in_bps, self.rate_out_bps)
+        return self.rate_in_bps / 1024.0, self.rate_out_bps / 1024.0
+
+    def reset_metrics(self):
+        """Сброс измерений (при новом подключении)."""
+        self.latency_ms = 0.0
+        self.latency_samples.clear()
+        self.bytes_in = self.bytes_out = 0
+        self.rate_in_bps = self.rate_out_bps = 0.0
+        self.rtt_peak_ms = 0.0
+        self.throughput_peak_bps = 0.0
+        self._stats_prev_in = self._stats_prev_out = 0
+        self._stats_prev_time = time.time()
+        self._ping_pending = False
+        self._ping_seq = 0
 
     # =========================================================================
     # ОБЩАЯ МАРШРУТИЗАЦИЯ И ОТПРАВКА СООБЩЕНИЙ
@@ -477,6 +601,18 @@ class NetworkManager(QObject):
         elif msg_type == "REQUEST_SYNC":
             # Напарник попросил актуальный код
             self.sync_requested_signal.emit()
+
+        elif msg_type == "PING":
+            # Отвечаем сразу: метка времени возвращается обратно, и отправитель
+            # измеряет круговое время. Ответ служебный, в статистику не входит.
+            self._broadcast({
+                "type": "PONG",
+                "ts": msg.get("ts", 0),
+                "seq": msg.get("seq", 0),
+            })
+
+        elif msg_type == "PONG":
+            self._on_pong(msg)
 
         elif msg_type == "CODE_UPDATE":
             code = msg.get("code", "")
