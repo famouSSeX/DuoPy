@@ -15,6 +15,8 @@ import base64
 from datetime import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from duopy.p2p import P2PTransport
+
 try:
     import paho.mqtt.client as mqtt
     HAS_MQTT = True
@@ -88,6 +90,8 @@ class NetworkManager(QObject):
     file_save_requested = pyqtSignal(str, str)          # (rel_path, content)
     # Качество связи: (задержка в мс, КБ/с входящие, КБ/с исходящие)
     metrics_updated = pyqtSignal(float, float, float)
+    # Прямое соединение с напарником установлено: (адрес, «через что»)
+    transport_changed = pyqtSignal(str, str)
     # Правка фрагментом: (позиция, сколько символов заменяется, новый фрагмент,
     # имя файла, метка версии текста, на которой основана правка)
     code_edit_received = pyqtSignal(int, int, str, str, str)
@@ -118,6 +122,17 @@ class NetworkManager(QObject):
         # Номера правок: свои для отправки, чужие — для контроля потерь
         self._edit_seq = 0
         self._peer_edit_seq = 0
+
+        # Прямое соединение (UDP hole punching). Объект создаём сразу, в главном
+        # потоке: Qt-сигналы из его потока приёма должны доставляться в GUI, а
+        # создание QObject из сетевого потока ломает эту доставку.
+        self.p2p: P2PTransport = P2PTransport(self)
+        self.p2p.connected_signal.connect(self._on_p2p_connected)
+        self.p2p.failed_signal.connect(self._on_p2p_failed)
+        self.p2p.message_received.connect(self._dispatch_message)
+        self.p2p.probe_received.connect(self._on_p2p_probe)
+        self.transport = "relay"          # "relay" или "p2p"
+        self._p2p_accepted = False        # ответ на предложение прямого канала уже отправлен
 
         # Режимы сети: "cloud" или "tcp"
         self.mode: str | None = None
@@ -202,12 +217,17 @@ class NetworkManager(QObject):
                             })
                             if self.is_host:
                                 self.status_signal.emit(f"Комната {self.room_code} готова! Напарник может войти по этому коду.")
+                                # Готовим прямой канал: когда напарник войдёт,
+                                # адресами обменяемся через брокер
+                                self.start_p2p()
                             else:
                                 self.status_signal.emit(f"Вы вошли в комнату {self.room_code}!")
                                 self._cloud_send({
                                     "type": "REQUEST_SYNC",
                                     "sender_id": self.user_id
                                 })
+                                # Пробуем перейти на прямое соединение
+                                self.start_p2p()
                         else:
                             # Тихое восстановление связи после секундного перерыва сети
                             self.status_signal.emit(f"🟢 Связь с комнатой {self.room_code} восстановлена")
@@ -616,10 +636,31 @@ class NetworkManager(QObject):
                     "color": self.user_color,
                     "is_reply": True
                 })
+                # Как только напарник появился, предлагаем прямой канал:
+                # дальше правки пойдут напрямую, минуя посредника
+                if self.mode == "cloud":
+                    self.start_p2p()
 
         elif msg_type == "REQUEST_SYNC":
             # Напарник попросил актуальный код
             self.sync_requested_signal.emit()
+
+        elif msg_type == "P2P_HELLO":
+            # Напарник сообщил адреса для прямого соединения
+            self._handle_p2p_hello(msg)
+
+        elif msg_type == "P2P_ACCEPT":
+            # Напарник принял предложение и прислал свои адреса
+            self._handle_p2p_accept(msg)
+
+        elif msg_type == "P2P_ASK":
+            if self.p2p is not None:
+                self._cloud_send({
+                    "type": "P2P_HELLO",
+                    "ip": get_local_ip(),
+                    "port": self.p2p.local_port,
+                    "ext": list(self.p2p.external_endpoint) if self.p2p.external_endpoint else None,
+                })
 
         elif msg_type == "PING":
             # Отвечаем сразу: метка времени возвращается обратно, и отправитель
@@ -750,11 +791,111 @@ class NetworkManager(QObject):
             self.file_save_requested.emit(path, content)
 
     def _broadcast(self, data: dict):
-        """Отправка сообщения в активный канал (Cloud или TCP)."""
+        """
+        Отправка сообщения в активный канал.
+
+        Если установлено прямое соединение с напарником, трафик идёт напрямую
+        (минуя посредника); иначе — через брокер или TCP.
+        """
+        if self.p2p is not None and self.p2p.is_connected and self.p2p.send(data):
+            return
         if self.mode == "cloud":
             self._cloud_send(data)
         elif self.mode == "tcp":
             self._tcp_send(data)
+
+    # =========================================================================
+    # ПРЯМОЕ СОЕДИНЕНИЕ (P2P)
+    # =========================================================================
+
+    def start_p2p(self):
+        """
+        Попытка перейти на прямой канал.
+
+        Адресами обмениваемся через уже работающий канал (брокер): это
+        единственное, для чего нужен посредник. Дальше стороны одновременно
+        простукивают друг друга, открывая соответствия в своих NAT.
+        """
+        if self.p2p.is_connected:
+            return
+        try:
+            self.p2p.open()
+        except Exception as e:
+            print(f"[DuoPy] Не удалось открыть UDP для прямого канала: {e}")
+            return
+
+        # Просим напарника сообщить свои адреса
+        self._cloud_send({
+            "type": "P2P_HELLO",
+            "ip": get_local_ip(),
+            "port": self.p2p.local_port,
+            "ext": list(self.p2p.external_endpoint) if self.p2p.external_endpoint else None,
+        })
+
+    def _on_p2p_connected(self, endpoint: str):
+        """Прямой канал подтверждён: переключаемся на него."""
+        self.transport = "p2p"
+        self.status_signal.emit(f"⚡ Прямое соединение с напарником: {endpoint}")
+        self.transport_changed.emit(endpoint, "p2p")
+
+    def _on_p2p_failed(self, reason: str):
+        """Прямой канал не сложился — остаёмся на брокере, связь не теряется."""
+        self.transport = "relay"
+        self.status_signal.emit(f"Работаем через сервер комнат ({reason})")
+        self.transport_changed.emit("", "relay")
+
+    def _on_p2p_probe(self, addr: str, port: int):
+        """От напарника пришёл пакет: запоминаем его адрес и начинаем простукивание."""
+        if self.p2p.is_connected:
+            return
+        self.p2p.start_connecting([(addr, port)], timeout=6.0)
+
+    def _handle_p2p_hello(self, msg: dict):
+        """
+        Напарник сообщил свои адреса — начинаем простукивание.
+
+        Отвечаем отдельным типом сообщения (P2P_ACCEPT), а не повторным HELLO:
+        иначе два клиента отвечали друг другу бесконечно.
+        """
+        candidates = self._p2p_candidates(msg)
+        if candidates:
+            self.p2p.start_connecting(candidates, timeout=8.0)
+
+        if not msg.get("is_reply") and not self._p2p_accepted:
+            # Отвечаем ровно один раз за сессию
+            self._p2p_accepted = True
+            self._cloud_send({
+                "type": "P2P_ACCEPT",
+                "is_reply": True,
+                "ip": get_local_ip(),
+                "port": self.p2p.local_port,
+                "ext": list(self.p2p.external_endpoint) if self.p2p.external_endpoint else None,
+            })
+
+    def _handle_p2p_accept(self, msg: dict):
+        """Напарник принял предложение прямого канала и прислал свои адреса."""
+        candidates = self._p2p_candidates(msg)
+        if candidates and not self.p2p.is_connected:
+            self.p2p.start_connecting(candidates, timeout=8.0)
+
+    @staticmethod
+    def _p2p_candidates(msg: dict) -> list[tuple[str, int]]:
+        """Разбор адресов напарника из сообщения обмена."""
+        candidates = []
+        ext = msg.get("ext")
+        if isinstance(ext, (list, tuple)) and len(ext) == 2:
+            try:
+                candidates.append((str(ext[0]), int(ext[1])))
+            except (TypeError, ValueError):
+                pass
+        peer_ip = msg.get("ip")
+        peer_port = msg.get("port")
+        if peer_ip and peer_port:
+            try:
+                candidates.append((str(peer_ip), int(peer_port)))
+            except (TypeError, ValueError):
+                pass
+        return candidates
 
     # Публичные методы отправки
     def send_code_update(self, code: str, file_name: str = ""):
@@ -910,6 +1051,13 @@ class NetworkManager(QObject):
         self.running = False
         self.is_connected = False
         self.initial_joined = False
+        self.transport = "relay"
+
+        # Закрываем прямой канал: сокет и поток приёма
+        try:
+            self.p2p.close()
+        except Exception:
+            pass
 
         if self.mqtt_client:
             try:
