@@ -1048,5 +1048,143 @@ class TestUpdater(unittest.TestCase):
                 sys.frozen = previous
 
 
+class TestConnectionSpeed(unittest.TestCase):
+    """Измерение качества связи: задержка (ping/pong) и скорость передачи текста."""
+
+    def test_ping_measures_latency(self):
+        """PING/PONG измеряет круговое время и попадает в статистику."""
+        import time as _time
+        host = NetworkManager("Хост", "#4ec9b0")
+        guest = NetworkManager("Гость", "#ff9800")
+
+        port = 9963
+        host.start_host(port)
+        for _ in range(25):
+            app.processEvents()
+            _time.sleep(0.02)
+        try:
+            guest.connect_to_host("127.0.0.1", port)
+            for _ in range(80):
+                app.processEvents()
+                if host.is_connected and guest.is_connected:
+                    break
+                _time.sleep(0.03)
+            self.assertTrue(host.is_connected and guest.is_connected)
+
+            self.assertEqual(host.latency_ms, 0.0, "до замера задержка неизвестна")
+
+            # Даём циклу чтения на стороне хоста запуститься: флаг соединения
+            # выставляется чуть раньше, чем сокет начинает читаться
+            for _ in range(20):
+                app.processEvents()
+                _time.sleep(0.03)
+
+            # Ping отправляем с повтором: первый может попасть в момент,
+            # когда хост ещё не вошёл в цикл чтения
+            for _ in range(5):
+                host.send_ping()
+                for _ in range(40):
+                    app.processEvents()
+                    if host.latency_samples:
+                        break
+                    _time.sleep(0.03)
+                if host.latency_samples:
+                    break
+
+            # На localhost задержка может быть ровно 0 мс (быстрее разрешения
+            # часов), поэтому проверяем сам факт замера, а не его величину
+            self.assertGreaterEqual(len(host.latency_samples), 1,
+                                    "замер задержки должен состояться")
+            self.assertGreater(host.rtt_peak_ms, -1.0, "пик задержки должен быть посчитан")
+            self.assertLess(host.latency_ms, 5000.0, "на localhost задержка не может быть огромной")
+        finally:
+            host.stop()
+            guest.stop()
+
+    def test_ping_requires_connection(self):
+        """Без соединения ping не отправляется и метрики не портятся."""
+        net = NetworkManager("Один", "#4ec9b0")
+        self.assertFalse(net.send_ping())
+        self.assertEqual(net.latency_ms, 0.0)
+
+    def test_text_rate_smoothing_and_counters(self):
+        """Счётчики байтов и сглаживание скорости дают читаемый показатель."""
+        net = NetworkManager("Тест", "#4ec9b0")
+        net.reset_metrics()
+        self.assertEqual(net.rate_in_bps, 0.0)
+
+        # Имитируем приём 4 КБ за одно окно замера
+        net.bytes_in = 4096
+        time.sleep(0.06)
+        net.update_rates()
+        self.assertGreater(net.rate_in_bps, 0.0)
+        self.assertGreater(net.throughput_peak_bps, 0.0)
+
+        # Ничего не приходит: скорость должна затухать, а не обнуляться мгновенно
+        for _ in range(2):
+            time.sleep(0.06)
+            net.update_rates()
+        self.assertGreater(net.rate_in_bps, 0.0, "показатель должен затухать постепенно")
+        for _ in range(10):
+            time.sleep(0.06)
+            net.update_rates()
+        self.assertEqual(net.rate_in_bps, 0.0, "после паузы скорость обнуляется")
+
+        # Сброс очищает и пиковые значения
+        net.reset_metrics()
+        self.assertEqual(net.bytes_in, 0)
+        self.assertEqual(net.throughput_peak_bps, 0.0)
+        self.assertEqual(net.latency_samples, [])
+
+    def test_speed_indicator_reflects_state(self):
+        """Индикатор в статус-баре отражает отсутствие связи и активную задержку."""
+        from duopy.main_window import MainWindow
+        win = MainWindow()
+        try:
+            win._stop_metrics()
+            self.assertIn("нет связи", win.lbl_sb_speed.text())
+
+            # Имитируем активную сессию с хорошей задержкой
+            win.network.is_connected = True
+            win.network.latency_ms = 42.0
+            win.network.latency_samples = [40.0, 42.0]
+            win.network.rate_in_bps = 2048.0
+            win.network.rate_out_bps = 0.0
+            win._update_speed_label()
+            text = win.lbl_sb_speed.text()
+            self.assertIn("42 мс", text)
+            self.assertIn("2.0 КБ/с", text, "скорость должна показываться в КБ/с")
+
+            # Очень быстрый канал: 0 мс — это замер, а не его отсутствие
+            win.network.latency_ms = 0.0
+            win.network.rate_in_bps = 0.0
+            win._update_speed_label()
+            self.assertIn("<1 мс", win.lbl_sb_speed.text(), win.lbl_sb_speed.text())
+
+            # Плохая связь — красный индикатор
+            win.network.latency_ms = 900.0
+            win._update_speed_label()
+            self.assertTrue(win.lbl_sb_speed.text().startswith("🔴"),
+                            win.lbl_sb_speed.text())
+        finally:
+            win.network.is_connected = False
+            win.close()
+
+    def test_peers_list_shows_latency(self):
+        """В списке участников рядом с напарником видна задержка."""
+        from duopy.main_window import MainWindow
+        win = MainWindow()
+        try:
+            win.network.is_connected = True
+            win.peer_name = "Напарник"
+            win.network.latency_ms = 37.0
+            win._update_peers_list()
+            items = [win.peers_list.item(i).text() for i in range(win.peers_list.count())]
+            self.assertTrue(any("37 мс" in t for t in items), items)
+        finally:
+            win.network.is_connected = False
+            win.close()
+
+
 if __name__ == "__main__":
     unittest.main()
