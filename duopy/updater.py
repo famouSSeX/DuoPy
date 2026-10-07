@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout
 )
 
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 GITHUB_OWNER = "famouSSeX"
 GITHUB_REPO = "DuoPy"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
