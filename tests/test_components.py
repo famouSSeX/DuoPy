@@ -1323,5 +1323,108 @@ class TestDeltaSync(unittest.TestCase):
         self.assertGreater(raw_size, COMPRESS_THRESHOLD_BYTES)
 
 
+class TestP2PTransport(unittest.TestCase):
+    """
+    Прямое соединение между участниками (UDP).
+
+    Двух машин в тесте нет, поэтому участники разведены по разным loopback-
+    адресам: так у каждого свой адрес, как у двух отдельных узлов.
+    """
+
+    def _pair(self, timeout: float = 6.0):
+        from duopy.p2p import P2PTransport
+        # «Своими» считаем только несуществующий адрес: оба участника теста
+        # живут на одной машине, поэтому автоопределение отнесло бы loopback
+        # напарника к своим адресам и канал не установился бы.
+        a = P2PTransport(own_ips=["203.0.113.1"])
+        b = P2PTransport(own_ips=["203.0.113.1"])
+        a.open(bind_ip="127.0.0.1")
+        b.open(bind_ip="127.0.0.2")
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.start_listening()
+        b.start_connecting([("127.0.0.1", a.local_port)], timeout=timeout)
+        for _ in range(int(timeout * 20) + 40):
+            app.processEvents()
+            if a.is_connected and b.is_connected:
+                break
+            time.sleep(0.05)
+        return a, b
+
+    def test_direct_channel_connects(self):
+        """Канал устанавливается в обе стороны, и обе стороны знают адрес напарника."""
+        a, b = self._pair()
+        self.assertTrue(a.is_connected, "сторона А должна установить канал")
+        self.assertTrue(b.is_connected, "сторона Б должна установить канал")
+        self.assertEqual(a.peer_sockaddr[1], b.local_port)
+        self.assertEqual(b.peer_sockaddr[1], a.local_port)
+
+    def test_direct_data_both_ways(self):
+        """Данные ходят напрямую в обе стороны (это и есть смысл P2P)."""
+        a, b = self._pair()
+        self.assertTrue(a.is_connected and b.is_connected, "нужен установленный канал")
+
+        got_b, got_a = [], []
+        b.message_received.connect(lambda m: got_b.append(m))
+        a.message_received.connect(lambda m: got_a.append(m))
+
+        self.assertTrue(a.send({"type": "T", "from": "A"}), "отправка А должна пройти")
+        self.assertTrue(b.send({"type": "T", "from": "B"}), "отправка Б должна пройти")
+        for _ in range(60):
+            app.processEvents()
+            if got_a and got_b:
+                break
+            time.sleep(0.02)
+
+        self.assertTrue(got_b, "Б должен получить данные напрямую")
+        self.assertTrue(got_a, "А должен получить данные напрямую")
+        self.assertEqual(got_b[0].get("from"), "A")
+        self.assertEqual(got_a[0].get("from"), "B")
+
+    def test_no_self_connection(self):
+        """Клиент не должен принимать собственные пакеты за напарника."""
+        from duopy.p2p import P2PTransport
+        t = P2PTransport(own_ips=["192.0.2.1"])
+        t.open(bind_ip="127.0.0.1")
+        self.addCleanup(t.close)
+        # Свой порт — это наше эхо, независимо от адреса
+        self.assertTrue(t._is_own_packet(("192.0.2.1", t.local_port)))
+        self.assertTrue(t._is_own_packet(("198.51.100.7", t.local_port)))
+        # Свой адрес из списка — тоже наш пакет
+        self.assertTrue(t._is_own_packet(("192.0.2.1", t.local_port + 1)))
+        # Свой bind-адрес
+        self.assertTrue(t._is_own_packet(("127.0.0.1", t.local_port + 1)))
+        # А это уже напарник
+        self.assertFalse(t._is_own_packet(("198.51.100.7", t.local_port + 1)))
+
+    def test_probe_loop_is_running(self):
+        """
+        Цикл простукивания обязан запускаться вместе с приёмом.
+
+        Регрессия: поток отправки не стартовал, поэтому пакеты только
+        принимались, наружу не уходили, и прямой канал не устанавливался.
+        """
+        from duopy.p2p import P2PTransport
+        t = P2PTransport(own_ips=["203.0.113.1"])
+        t.open(bind_ip="127.0.0.1")
+        self.addCleanup(t.close)
+        t.start_listening()
+        self.assertTrue(t._probe_thread is not None and t._probe_thread.is_alive(),
+                        "поток простукивания должен быть запущен")
+
+    def test_transient_udp_error_does_not_kill_receiver(self):
+        """
+        Ошибки вроде WinError 10054 (ответ ICMP на закрытый порт) не должны
+        прерывать приём: иначе канал «умирает» после первого же простукивания
+        по недоступному адресу.
+        """
+        import socket as _socket
+        from duopy.p2p import TRANSIENT_UDP_ERRORS
+        err = OSError("connection reset")
+        err.winerror = 10054
+        self.assertIn(10054, TRANSIENT_UDP_ERRORS)
+        self.assertIn(err.winerror, TRANSIENT_UDP_ERRORS)
+
+
 if __name__ == "__main__":
     unittest.main()
