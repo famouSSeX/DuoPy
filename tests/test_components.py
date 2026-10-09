@@ -1331,19 +1331,22 @@ class TestP2PTransport(unittest.TestCase):
     адресам: так у каждого свой адрес, как у двух отдельных узлов.
     """
 
-    def _pair(self, timeout: float = 6.0):
+    def _pair(self, timeout: float = 6.0, bind_ip: str | None = None):
         from duopy.p2p import P2PTransport
         # «Своими» считаем только несуществующий адрес: оба участника теста
         # живут на одной машине, поэтому автоопределение отнесло бы loopback
         # напарника к своим адресам и канал не установился бы.
         a = P2PTransport(own_ips=["203.0.113.1"])
         b = P2PTransport(own_ips=["203.0.113.1"])
-        a.open(bind_ip="127.0.0.1")
+        # Простукивание несёт идентификатор сессии: он отсекает посторонние
+        # пакеты, поэтому у участников он должен совпадать
+        b.session_id = a.session_id
+        a.open(bind_ip=bind_ip or "127.0.0.1")
         b.open(bind_ip="127.0.0.2")
         self.addCleanup(a.close)
         self.addCleanup(b.close)
         a.start_listening()
-        b.start_connecting([("127.0.0.1", a.local_port)], timeout=timeout)
+        b.start_connecting([(a.bind_ip, a.local_port)], timeout=timeout)
         for _ in range(int(timeout * 20) + 40):
             app.processEvents()
             if a.is_connected and b.is_connected:
@@ -1382,20 +1385,36 @@ class TestP2PTransport(unittest.TestCase):
         self.assertEqual(got_a[0].get("from"), "B")
 
     def test_no_self_connection(self):
-        """Клиент не должен принимать собственные пакеты за напарника."""
+        """
+        Собственное эхо не должно приниматься за напарника.
+
+        Признаки «это наш пакет»: порт отправителя равен нашему порту либо
+        адрес отправителя совпадает с адресом, к которому привязан сокет.
+        Регрессия: проверка стояла только в обработчике простукиваний, поэтому
+        любой другой свой пакет «подключал» клиента к самому себе.
+        """
         from duopy.p2p import P2PTransport
-        t = P2PTransport(own_ips=["192.0.2.1"])
+        t = P2PTransport(own_ips=["203.0.113.1"])
         t.open(bind_ip="127.0.0.1")
         self.addCleanup(t.close)
-        # Свой порт — это наше эхо, независимо от адреса
-        self.assertTrue(t._is_own_packet(("192.0.2.1", t.local_port)))
-        self.assertTrue(t._is_own_packet(("198.51.100.7", t.local_port)))
-        # Свой адрес из списка — тоже наш пакет
-        self.assertTrue(t._is_own_packet(("192.0.2.1", t.local_port + 1)))
-        # Свой bind-адрес
+        # Пакет с нашего порта — наше эхо
+        self.assertTrue(t._is_own_packet(("192.0.2.10", t.local_port)))
+        # Пакет с нашего адреса привязки — тоже наше эхо
         self.assertTrue(t._is_own_packet(("127.0.0.1", t.local_port + 1)))
-        # А это уже напарник
-        self.assertFalse(t._is_own_packet(("198.51.100.7", t.local_port + 1)))
+        # А это напарник с другого адреса и порта
+        self.assertFalse(t._is_own_packet(("192.0.2.10", t.local_port + 1)))
+
+    def test_bind_address_own_only_when_bound(self):
+        """
+        При обычной работе сокет слушает 0.0.0.0, и адрес отправителя сам по
+        себе ничего не значит: пакеты напарника принимать можно.
+        """
+        from duopy.p2p import P2PTransport
+        t = P2PTransport(own_ips=["203.0.113.1"])
+        t.open()
+        self.addCleanup(t.close)
+        self.assertEqual(t.bind_ip, "0.0.0.0")
+        self.assertFalse(t._is_own_packet(("127.0.0.1", t.local_port + 1)))
 
     def test_probe_loop_is_running(self):
         """
@@ -1424,6 +1443,180 @@ class TestP2PTransport(unittest.TestCase):
         err.winerror = 10054
         self.assertIn(10054, TRANSIENT_UDP_ERRORS)
         self.assertIn(err.winerror, TRANSIENT_UDP_ERRORS)
+
+
+class TestRelaySelection(unittest.TestCase):
+    """
+    Выбор сервера комнат.
+
+    Регрессия: каждый клиент подключался к первому доступному брокеру, и в
+    разных сетях это оказывались разные серверы — участники не видели друг
+    друга, хотя оба «успешно вошли в комнату».
+    """
+
+    def test_both_peers_pick_same_broker(self):
+        from duopy.network import broker_order_for_room
+        # Код комнаты вводится вручную и может отличаться регистром/пробелами
+        for code in ("DUO-1234", "duo-1234", " DUO-1234 ", "DUO-0007"):
+            first = broker_order_for_room(code)[0]
+            for other in ("DUO-1234", " duo-1234"):
+                if other.strip().upper() == code.strip().upper():
+                    self.assertEqual(first, broker_order_for_room(other)[0],
+                                     f"для кода {code!r} сервер должен совпадать")
+
+    def test_plain_and_tls_variants_available(self):
+        """Для выбранного сервера пробуем шифрованный порт, затем обычный."""
+        from duopy.network import broker_order_for_room
+        order = broker_order_for_room("DUO-1234")
+        host0 = order[0][0]
+        variants = [(h, p, t) for h, p, t in order if h == host0]
+        self.assertIn((host0, 8883, True), variants, "сначала шифрованный порт")
+        self.assertIn((host0, 1883, False), variants, "затем обычный порт")
+        self.assertEqual(order[0][1], 8883, "первым идёт шифрованный порт")
+
+    def test_backup_broker_present(self):
+        """Остальные серверы остаются запасными, чтобы не терять связь вовсе."""
+        from duopy.network import broker_order_for_room, RELAY_HOSTS
+        order = broker_order_for_room("DUO-1234")
+        hosts = [h for h, _, _ in order]
+        for host in RELAY_HOSTS:
+            self.assertIn(host, hosts, f"{host} должен быть в списке")
+        self.assertEqual(hosts[0], order[0][0])
+        self.assertEqual(hosts[0], order[1][0], "оба порта выбранного сервера идут подряд")
+
+    def test_room_codes_spread_across_brokers(self):
+        """Коды комнат распределяются по серверам, а не липнут к одному."""
+        from duopy.network import broker_order_for_room, RELAY_HOSTS
+        chosen = {broker_order_for_room(f"DUO-{i:04d}")[0][0] for i in range(200)}
+        self.assertEqual(len(chosen), len(RELAY_HOSTS),
+                         "оба сервера должны использоваться")
+
+
+class TestDirectWithoutBroker(unittest.TestCase):
+    """
+    Прямое соединение по коду-приглашению: посредник не участвует.
+
+    Участники разведены по разным loopback-адресам, потому что на одной машине
+    иначе они неразличимы.
+    """
+
+    def setUp(self):
+        import duopy.p2p as p2p_module
+        # Свой пакет отличается портом отправителя, а адрес напарника
+        # отбрасывать нельзя: подменяем список «своих» адресов на заглушку
+        original = p2p_module.P2PTransport.__init__
+
+        def patched(self, parent=None, own_ips=None, session_id=""):
+            original(self, parent, own_ips=["203.0.113.1"], session_id=session_id)
+
+        p2p_module.P2PTransport.__init__ = patched
+        self.addCleanup(lambda: setattr(p2p_module.P2PTransport, "__init__", original))
+        self._original = original
+
+    def _pair(self, timeout: float = 10.0):
+        from duopy.network import NetworkManager
+        host = NetworkManager("Хост")
+        guest = NetworkManager("Гость")
+        self.addCleanup(host.stop)
+        self.addCleanup(guest.stop)
+
+        ok, code = host.create_direct_invite(bind_ip="127.0.0.1",
+                                             external_override=("127.0.0.1", None))
+        self.assertTrue(ok, f"код-приглашение должен создаться: {code}")
+        self.assertTrue(code.startswith("DP1-"), code)
+
+        ok2, _answer = guest.connect_to_invite(code, bind_ip="127.0.0.2")
+        self.assertTrue(ok2, "подключение по коду должно начаться")
+
+        for _ in range(int(timeout * 20)):
+            app.processEvents()
+            if host.p2p.is_connected and guest.p2p.is_connected:
+                break
+            time.sleep(0.05)
+        return host, guest, code
+
+    def test_channel_established_without_broker(self):
+        host, guest, _code = self._pair()
+        self.assertIsNone(host.mqtt_client, "брокер не должен использоваться")
+        self.assertIsNone(guest.mqtt_client, "брокер не должен использоваться")
+        self.assertEqual(host.mode, "direct")
+        self.assertTrue(host.p2p.is_connected, "хост должен установить канал")
+        self.assertTrue(guest.p2p.is_connected, "гость должен установить канал")
+        # Каждый знает адрес другого, а не свой
+        self.assertNotEqual(host.p2p.peer_sockaddr[1], host.p2p.local_port,
+                            "хост не должен «подключиться» к себе")
+        self.assertEqual(host.p2p.peer_sockaddr[1], guest.p2p.local_port)
+
+    def test_data_flows_both_ways(self):
+        host, guest, _code = self._pair()
+        self.assertTrue(host.p2p.is_connected and guest.p2p.is_connected,
+                        "нужен установленный канал")
+
+        got_guest, got_host = [], []
+        guest.text_received.connect(lambda c: got_guest.append(c))
+        host.text_received.connect(lambda c: got_host.append(c))
+
+        host.send_code_update("print('от хоста')\n", "main.py")
+        guest.send_code_update("print('от гостя')\n", "main.py")
+        for _ in range(80):
+            app.processEvents()
+            if got_guest and got_host:
+                break
+            time.sleep(0.02)
+
+        self.assertTrue(got_guest, "гость должен получить код")
+        self.assertTrue(got_host, "хост должен получить код")
+        self.assertIn("от хоста", got_guest[0])
+        self.assertIn("от гостя", got_host[0])
+
+    def test_peers_learn_names(self):
+        """В прямом режиме знакомиться нужно самим: посредника нет."""
+        host, guest, _code = self._pair()
+        names = []
+        host.connected_signal.connect(lambda n, s: names.append(n))
+        guest.connected_signal.connect(lambda n, s: names.append(n))
+        for _ in range(60):
+            app.processEvents()
+            if len(names) >= 2:
+                break
+            time.sleep(0.02)
+        self.assertIn("Гость", names)
+        self.assertIn("Хост", names)
+
+
+class TestDirectCodeParsing(unittest.TestCase):
+    """Разбор кода-приглашения: формат, устойчивость к опечаткам."""
+
+    def test_parses_generated_code(self):
+        from duopy.network import parse_direct_code
+        for code in ("DP1-203.0.113.5-8765-ab12cd34",
+                     "DP1-203.0.113.5-8765-ab12cd34-192.168.1.7"):
+            targets, session = parse_direct_code(code)
+            self.assertEqual(targets[0], ("203.0.113.5", 8765))
+            self.assertEqual(session, "ab12cd34")
+
+    def test_local_address_is_backup_target(self):
+        from duopy.network import parse_direct_code
+        targets, _ = parse_direct_code("DP1-203.0.113.5-8765-ab12cd34-192.168.1.7")
+        self.assertEqual(len(targets), 2, "локальный адрес идёт запасным")
+        self.assertEqual(targets[1], ("192.168.1.7", 8765))
+
+    def test_case_and_prefix_tolerance(self):
+        from duopy.network import parse_direct_code
+        upper = parse_direct_code("DP1-203.0.113.5-8765-AB12CD34")
+        lower = parse_direct_code("dp1-203.0.113.5-8765-ab12cd34")
+        self.assertEqual(upper, lower, "регистр не должен влиять")
+        # Приставку можно не копировать
+        self.assertEqual(parse_direct_code("203.0.113.5-8765-ab12cd34"),
+                         lower)
+
+    def test_broken_codes_rejected(self):
+        from duopy.network import parse_direct_code
+        for bad in ("", "DP1-203.0.113.5", "DP1-203.0.113.5-99999-ab12cd34",
+                    "DP1-203.0.113.5-abc-ab12cd34", "DP1-203.0.113.5-8765",
+                    "DP1-203.0.113.5-8765-ab12cd34-192.168.1.7-лишнее"):
+            with self.assertRaises(ValueError, msg=f"должен быть отклонён: {bad!r}"):
+                parse_direct_code(bad)
 
 
 if __name__ == "__main__":
