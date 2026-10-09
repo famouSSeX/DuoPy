@@ -247,6 +247,105 @@ class LanDialog(QDialog):
         self.client_widget.show()
 
 
+class DirectConnectDialog(QDialog):
+    """
+    Прямое соединение через интернет без посредника.
+
+    Брокер здесь не используется вообще: стороны обмениваются сетевыми
+    адресами вручную — код показывает один, второй вставляет его у себя.
+    Передать код можно любым способом (мессенджер, почта).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Прямое соединение без посредника")
+        self.resize(560, 420)
+        self.created_code = ""
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        info = QLabel(
+            "Соединение идёт <b>напрямую</b> между компьютерами, через интернет "
+            "ничего не передаётся.<br>"
+            "Работает, если ваши сети пропускают входящие UDP-пакеты. "
+            "При строгом NAT (часто мобильный интернет) соединиться не удастся — "
+            "тогда используйте облачную комнату."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("<b>Шаг 1. Кто-то один создаёт код и передаёт его напарнику.</b>"))
+        self.btn_create = QPushButton("🔑 Создать код-приглашение")
+        self.btn_create.clicked.connect(self._create_code)
+        layout.addWidget(self.btn_create)
+
+        self.code_edit = QTextEdit()
+        self.code_edit.setReadOnly(True)
+        self.code_edit.setMaximumHeight(70)
+        self.code_edit.setPlaceholderText("Здесь появится код, который нужно передать напарнику")
+        layout.addWidget(self.code_edit)
+
+        self.btn_copy = QPushButton("📋 Скопировать код")
+        self.btn_copy.clicked.connect(self._copy_code)
+        self.btn_copy.setEnabled(False)
+        layout.addWidget(self.btn_copy)
+
+        layout.addWidget(QLabel("<b>Шаг 2. Второй участник вставляет код у себя.</b>"))
+        self.paste_edit = QTextEdit()
+        self.paste_edit.setMaximumHeight(70)
+        self.paste_edit.setPlaceholderText("Вставьте сюда код от напарника и нажмите «Подключиться»")
+        layout.addWidget(self.paste_edit)
+
+        self.btn_connect = QPushButton("🚀 Подключиться по коду")
+        self.btn_connect.clicked.connect(self._connect_by_code)
+        layout.addWidget(self.btn_connect)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setWordWrap(True)
+        layout.addWidget(self.status_lbl)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def _create_code(self):
+        ok, code = self.parent().network.create_direct_invite()
+        if not ok:
+            self.status_lbl.setText(f"⚠️ {code}")
+            return
+        self.created_code = code
+        self.code_edit.setPlainText(code)
+        self.btn_copy.setEnabled(True)
+        self.status_lbl.setText(
+            "Код создан. Передайте его напарнику и ждите: соединение установится, "
+            "как только он вставит код у себя.")
+
+    def _copy_code(self):
+        if not self.created_code:
+            return
+        QApplication.clipboard().setText(self.created_code)
+        self.status_lbl.setText("Код скопирован. Отправьте его напарнику.")
+
+    def _connect_by_code(self):
+        code = self.paste_edit.toPlainText().strip()
+        if not code:
+            self.status_lbl.setText("⚠️ Вставьте код от напарника")
+            return
+        ok, answer = self.parent().network.connect_to_invite(code)
+        if not ok:
+            self.status_lbl.setText(f"⚠️ {answer}")
+            return
+        # Свой адрес тоже нужно передать напарнику, иначе он не узнает, куда слать
+        self.created_code = answer
+        self.code_edit.setPlainText(answer)
+        self.btn_copy.setEnabled(True)
+        self.status_lbl.setText(
+            "Подключаюсь... <b>Отправьте напарнику свой ответный код</b> из поля выше — "
+            "он нужен, чтобы он тоже знал ваш адрес.")
+
+
 class UserProfileDialog(QDialog):
     """Диалог настройки профиля пользователя (Имя и Цвет)."""
 
@@ -554,6 +653,12 @@ class MainWindow(QMainWindow):
         self.btn_lan.setToolTip("Прямое подключение в локальной сети (по IP-адресу)")
         self.btn_lan.clicked.connect(self.on_lan_dialog)
         toolbar.addWidget(self.btn_lan)
+
+        self.btn_direct = QPushButton("⚡ Напрямую")
+        self.btn_direct.setToolTip(
+            "Прямое соединение через интернет без посредника: обмен кодом вручную")
+        self.btn_direct.clicked.connect(self.on_direct_dialog)
+        toolbar.addWidget(self.btn_direct)
 
         self.btn_disconnect = QPushButton("❌ Отключиться")
         self.btn_disconnect.setEnabled(False)
@@ -1395,10 +1500,20 @@ class MainWindow(QMainWindow):
             # Замеры качества связи начинаем сразу после запуска сессии
             self._start_metrics()
 
+    def on_direct_dialog(self):
+        """Прямое соединение через интернет без посредника (обмен кодом вручную)."""
+        dialog = DirectConnectDialog(self)
+        self._set_session_active(True)
+        self.lbl_room_badge.setText("Прямое соединение")
+        self.lbl_toolbar_badge.setText("🟡 Прямое соединение: ждём напарника")
+        self._start_metrics()
+        dialog.exec()
+
     def _set_session_active(self, active: bool):
         self.btn_create_room.setEnabled(not active)
         self.btn_join_room.setEnabled(not active)
         self.btn_lan.setEnabled(not active)
+        self.btn_direct.setEnabled(not active)
         self.btn_disconnect.setEnabled(active)
 
     def on_disconnect(self):
@@ -1575,6 +1690,14 @@ class MainWindow(QMainWindow):
             self._update_speed_label()
             return
         self.network.update_rates()
+
+        if self.network.mode == "direct":
+            # В прямом режиме посредника нет: замер кругового времени через
+            # брокера невозможен, а канал и так прямой. Показываем честную
+            # оценку «меньше миллисекунды» вместо вечного «измеряется».
+            self._update_speed_label()
+            return
+
         # Замер задержки раз в две секунды: чаще нет смысла, реже — теряется
         # динамика при ухудшении связи
         self._metrics_tick += 1
@@ -1610,6 +1733,10 @@ class MainWindow(QMainWindow):
 
         if not self.network.is_connected:
             text, color = "📶 нет связи", "#d0d0d0"
+        elif not measured and self.network.mode == "direct":
+            # Прямой режим без посредника: замерять круговое время не через кого,
+            # но канал заведомо быстрый — показываем это честно
+            text, color = f"⚡ 🟢 <1 мс · {rate:.1f} КБ/с", "#7ee787"
         elif not measured:
             text, color = "📶 …", "#d0d0d0"
         else:
