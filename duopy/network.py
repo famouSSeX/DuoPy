@@ -65,12 +65,26 @@ def broker_order_for_room(room_code: str) -> list[tuple[str, int, bool]]:
 # Прямое соединение по коду-приглашению (без посредника вообще)
 # ---------------------------------------------------------------------------
 
-# Прямое соединение по коду-приглашению: порт выбирается свободный, а
-# фактический адрес попадает в код, поэтому фиксировать порт не нужно (иначе
-# две копии на одной машине мешали бы друг другу).
+# Прямое соединение по коду-приглашению: порт ФИКСИРОВАННЫЙ. Это важно для
+# брандмауэра Windows: правило создаётся один раз для конкретного порта, а не
+# заново для каждого случайного. Без правила система молча выбрасывает
+# входящие пакеты, и соединение не устанавливается.
+DIRECT_PORT = 47820
 DIRECT_CODE_PREFIX = "DP1-"
 # Сколько ждём ответа напарника, прежде чем сообщить о неудаче
 DIRECT_TIMEOUT = 25.0
+
+
+def firewall_hint(port: int = DIRECT_PORT) -> str:
+    """
+    Готовая команда для разрешения входящих подключений.
+
+    Windows блокирует входящие UDP-пакеты, если для программы нет правила, —
+    при этом ничего не сообщает. Пользователь может выполнить команду один раз
+    от имени администратора (или разрешить доступ в диалоге брандмауэра).
+    """
+    return (f'New-NetFirewallRule -DisplayName "DuoPy (прямое соединение)" '
+            f'-Direction Inbound -Protocol UDP -LocalPort {port} -Action Allow')
 
 
 def parse_direct_code(code: str) -> tuple[list[tuple[str, int]], str]:
@@ -906,7 +920,8 @@ class NetworkManager(QObject):
     # =========================================================================
 
     def create_direct_invite(self, bind_ip: str = "0.0.0.0",
-                             external_override: tuple[str, int] | None = None) -> tuple[bool, str]:
+                             external_override: tuple[str, int] | None = None,
+                             port: int = DIRECT_PORT) -> tuple[bool, str]:
         """
         Подготовить прямое соединение и выдать код-приглашение.
 
@@ -925,7 +940,7 @@ class NetworkManager(QObject):
         self.p2p = self._ensure_p2p(session_id=os.urandom(4).hex())
 
         try:
-            self.p2p.open(bind_ip=bind_ip)
+            self.p2p.open(bind_ip=bind_ip, preferred_port=port)
         except Exception as e:
             return False, f"Не удалось открыть UDP-порт: {e}"
         if external_override and external_override[1]:
@@ -949,7 +964,8 @@ class NetworkManager(QObject):
         return True, code
 
     def connect_to_invite(self, code: str, bind_ip: str = "0.0.0.0",
-                          external_override: tuple[str, int] | None = None) -> tuple[bool, str]:
+                          external_override: tuple[str, int] | None = None,
+                          port: int = DIRECT_PORT) -> tuple[bool, str]:
         """
         Подключиться по коду-приглашению, который прислал напарник.
 
@@ -968,12 +984,12 @@ class NetworkManager(QObject):
             self.running = False
             return False, str(e)
 
-        # Свой порт выбирается свободным: фактический адрес уходит напарнику
-        # в ответном коде, поэтому договариваться о порте заранее не нужно
+        # Порт фиксированный: так правило брандмауэра создаётся один раз.
+        # Фактический адрес всё равно уходит напарнику в ответном коде.
         self.p2p = self._ensure_p2p(session_id=session_id)
 
         try:
-            self.p2p.open(bind_ip=bind_ip)
+            self.p2p.open(bind_ip=bind_ip, preferred_port=port)
         except Exception as e:
             return False, f"Не удалось открыть UDP-порт: {e}"
         if external_override:
@@ -1067,6 +1083,13 @@ class NetworkManager(QObject):
     def _on_p2p_failed(self, reason: str):
         """Прямой канал не сложился — остаёмся на брокере, связь не теряется."""
         self.transport = "relay"
+        if self.mode == "direct":
+            # В прямом режиме запасного канала нет: сообщаем причину и что
+            # именно можно сделать (обычно дело в брандмауэре)
+            self.is_connected = False
+            self.status_signal.emit(f"Прямое соединение не установлено: {reason}")
+            self.transport_changed.emit("", "direct_failed")
+            return
         self.status_signal.emit(f"Работаем через сервер комнат ({reason})")
         self.transport_changed.emit("", "relay")
 
