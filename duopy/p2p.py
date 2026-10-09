@@ -166,6 +166,12 @@ class P2PTransport(QObject):
         self._lock = threading.Lock()
         # Адрес, к которому привязан сокет (для тестов и проверки своего эха)
         self.bind_ip = "0.0.0.0"
+        # Счётчики для диагностики: видно, уходят ли пакеты и доходят ли чужие
+        self.probes_sent = 0
+        self.probes_received = 0
+        self.packets_in = 0
+        # Причина последней неудачи (для показа пользователю)
+        self.last_error = ""
 
     # ------------------------------------------------------------------ запуск
 
@@ -281,7 +287,16 @@ class P2PTransport(QObject):
                     return
             elif self._probe_targets:
                 if now > self._connect_deadline:
-                    self.failed_signal.emit("не удалось установить прямое соединение")
+                    if self.probes_received:
+                        reason = "напарник не отвечает (проверьте, что он вставил ваш ответный код)"
+                    elif self.probes_sent:
+                        # Мы стучимся, но к нам не пришло ни одного пакета:
+                        # чаще всего входящие блокирует брандмауэр или NAT
+                        reason = ("входящие пакеты не доходят: брандмауэр или NAT их блокирует")
+                    else:
+                        reason = "не удалось отправить ни одного пакета"
+                    self.last_error = reason
+                    self.failed_signal.emit(reason)
                     return
                 self._send_probe()
             elif not self.is_connected and now - self._last_probe_sent >= PROBE_INTERVAL:
@@ -300,6 +315,7 @@ class P2PTransport(QObject):
             try:
                 self.sock.sendto(payload, addr)
                 self._last_probe_sent = time.time()
+                self.probes_sent += 1
             except OSError as e:
                 # Ошибка отдельного простукивания не должна ломать попытку
                 if getattr(e, "winerror", None) not in TRANSIENT_UDP_ERRORS:
@@ -342,6 +358,7 @@ class P2PTransport(QObject):
             # принималось за напарника и канал «устанавливался» сам с собой.
             if self._is_own_packet(addr):
                 continue
+            self.packets_in += 1
 
             if data.startswith(PROBE_PREFIX):
                 self._handle_probe(addr, data[len(PROBE_PREFIX):].decode("ascii", "ignore"))
@@ -399,6 +416,7 @@ class P2PTransport(QObject):
             return
         if self._is_own_packet(addr):
             return
+        self.probes_received += 1
         self._last_peer_packet = time.time()
         if self.is_connected and self.peer_sockaddr != addr:
             # Пакет от чужого адреса по уже установленному каналу — игнорируем
