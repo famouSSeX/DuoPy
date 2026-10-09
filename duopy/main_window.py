@@ -29,7 +29,8 @@ from PyQt6.QtGui import (
 
 from duopy.editor import CodeEditor
 from duopy.find_replace import FindReplaceBar
-from duopy.network import NetworkManager, get_local_ip, generate_room_code
+from duopy.network import (NetworkManager, get_local_ip, generate_room_code,
+                           DIRECT_PORT, firewall_hint)
 from duopy.runner import (
     CodeRunner, get_python_interpreter, set_custom_python_path, is_valid_python
 )
@@ -268,12 +269,19 @@ class DirectConnectDialog(QDialog):
         info = QLabel(
             "Соединение идёт <b>напрямую</b> между компьютерами, через интернет "
             "ничего не передаётся.<br>"
-            "Работает, если ваши сети пропускают входящие UDP-пакеты. "
-            "При строгом NAT (часто мобильный интернет) соединиться не удастся — "
-            "тогда используйте облачную комнату."
+            "Работает, если ваши сети пропускают <b>входящие UDP-пакеты</b> на порт "
+            f"<b>{DIRECT_PORT}</b>. Windows по умолчанию их блокирует, поэтому при "
+            "первом запуске нужно разрешить доступ в брандмауэре — на обоих "
+            "компьютерах.<br>"
+            "Если сеть строгая (часто мобильный интернет), соединиться не "
+            "удастся — тогда используйте облачную комнату."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        self.btn_firewall = QPushButton("🛡 Как разрешить в брандмауэре")
+        self.btn_firewall.clicked.connect(self._show_firewall_help)
+        layout.addWidget(self.btn_firewall)
 
         layout.addWidget(QLabel("<b>Шаг 1. Кто-то один создаёт код и передаёт его напарнику.</b>"))
         self.btn_create = QPushButton("🔑 Создать код-приглашение")
@@ -309,6 +317,24 @@ class DirectConnectDialog(QDialog):
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
+
+    def _show_firewall_help(self):
+        """Подсказка, как разрешить входящие подключения в брандмауэре Windows."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Разрешение в брандмауэре")
+        box.setText(
+            "Windows по умолчанию отбрасывает входящие UDP-пакеты, ничего не сообщая.\n"
+            f"Для прямого соединения нужно разрешить порт {DIRECT_PORT}/UDP на обоих компьютерах."
+        )
+        box.setInformativeText(
+            "Проще всего: при первом запуске Windows спрашивает про доступ к сети — "
+            "нужно согласиться, отметив «частные сети».\n\n"
+            "Если окно не появилось или доступ был отклонён, выполните команду ниже "
+            "в PowerShell от имени администратора."
+        )
+        box.setDetailedText(firewall_hint(DIRECT_PORT))
+        box.exec()
 
     def _create_code(self):
         ok, code = self.parent().network.create_direct_invite()
@@ -1561,9 +1587,44 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"⚡ Прямое соединение с напарником: {endpoint}", 8000)
             self.append_chat_system(f"Прямое соединение установлено ({endpoint})")
+        elif kind == "direct_failed":
+            self.on_direct_failed()
         else:
             self.append_chat_system("Прямое соединение недоступно, работаем через сервер комнат")
         self._update_speed_label()
+
+    def on_direct_failed(self):
+        """
+        Прямое соединение не установилось.
+
+        Самая частая причина на Windows — брандмауэр молча выбрасывает входящие
+        UDP-пакеты: исходящие уходят, ответы не приходят, и снаружи это
+        выглядит как «ничего не происходит». Поэтому показываем и причину, и
+        готовую команду для разрешения.
+        """
+        self.statusBar().showMessage("Прямое соединение не установлено", 8000)
+        self.append_chat_system("Прямое соединение не установлено")
+        self._set_session_active(False)
+        self._stop_metrics()
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Прямое соединение не установлено")
+        box.setText("Не удалось установить прямое соединение между компьютерами.")
+        box.setInformativeText(
+            "Чаще всего причина в брандмауэре: Windows молча отбрасывает "
+            "входящие UDP-пакеты, если для программы нет разрешения.\n\n"
+            f"Порт: {DIRECT_PORT}/UDP — он должен быть разрешён на ОБОИХ компьютерах.\n\n"
+            "Что можно сделать:\n"
+            "1. Разрешить приложение в брандмауэре (при первом запуске Windows "
+            "обычно спрашивает — нужно согласиться).\n"
+            "2. Выполнить команду ниже в PowerShell от имени администратора.\n"
+            "3. На роутере может потребоваться проброс этого порта.\n"
+            "4. Если ничего не помогло — использовать облачную комнату: она "
+            "работает всегда, потому что не требует входящих подключений."
+        )
+        box.setDetailedText(firewall_hint(DIRECT_PORT))
+        box.exec()
 
     def on_peer_connected(self, peer_name: str, source: str):
         is_reconnect = (self.peer_name == peer_name)
