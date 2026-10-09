@@ -12,6 +12,8 @@ import time
 import random
 import zlib
 import base64
+import hashlib
+import os
 from datetime import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -31,6 +33,89 @@ DEFAULT_RELAY_BROKERS = [
     ("broker.emqx.io", 1883, False),
     ("broker.hivemq.com", 1883, False),
 ]
+
+# Уникальные серверы из списка (без повторов транспорта)
+RELAY_HOSTS = ["broker.emqx.io", "broker.hivemq.com"]
+
+
+def broker_order_for_room(room_code: str) -> list[tuple[str, int, bool]]:
+    """
+    Порядок подключения к серверам комнат, одинаковый у обоих участников.
+
+    Сервер выбирается по коду комнаты, а не по тому, кто первым ответил.
+    Раньше каждый клиент подключался к первому доступному брокеру: в разных
+    сетях это оказывались РАЗНЫЕ серверы, и участники не видели друг друга
+    вовсе, хотя оба «успешно вошли в комнату». Теперь код комнаты однозначно
+    определяет сервер, поэтому стороны всегда встречаются.
+
+    Порядок начинается с выбранного сервера (сначала шифрованный порт, затем
+    обычный), а остальные идут запасными — на случай, если основной недоступен.
+    """
+    code = (room_code or "").strip().upper()
+    primary = hashlib.blake2b(code.encode("utf-8"), digest_size=8).digest()[0] % len(RELAY_HOSTS)
+    ordered = [RELAY_HOSTS[primary]] + [h for i, h in enumerate(RELAY_HOSTS) if i != primary]
+    result = []
+    for host in ordered:
+        result.append((host, 8883, True))
+        result.append((host, 1883, False))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Прямое соединение по коду-приглашению (без посредника вообще)
+# ---------------------------------------------------------------------------
+
+# Прямое соединение по коду-приглашению: порт выбирается свободный, а
+# фактический адрес попадает в код, поэтому фиксировать порт не нужно (иначе
+# две копии на одной машине мешали бы друг другу).
+DIRECT_CODE_PREFIX = "DP1-"
+# Сколько ждём ответа напарника, прежде чем сообщить о неудаче
+DIRECT_TIMEOUT = 25.0
+
+
+def parse_direct_code(code: str) -> tuple[list[tuple[str, int]], str]:
+    """
+    Разбор кода-приглашения.
+
+    Формат: DP1-<адрес>-<порт>-<сессия>[-<локальный адрес>]. Частей после
+    приставки три или четыре, поэтому разбираем их по количеству: программа
+    всегда формирует код сама, и структура известна точно.
+
+    Локальный адрес добавляем как запасной вариант: если напарник оказался
+    в той же сети, соединение установится по нему, без выхода в интернет.
+    """
+    text = (code or "").strip().replace(" ", "").replace("\n", "")
+    if not text:
+        raise ValueError("Код пустой")
+
+    parts = text.split("-")
+    if parts and parts[0].upper() == DIRECT_CODE_PREFIX.rstrip("-"):
+        parts = parts[1:]
+
+    if len(parts) not in (3, 4):
+        raise ValueError("Код неполный: скопируйте его целиком")
+
+    host = parts[0]
+    port_text = parts[1]
+    session_id = parts[2].lower()
+    local_ip = parts[3] if len(parts) == 4 else None
+
+    if not host:
+        raise ValueError("В коде не указан адрес")
+    if not port_text.isdigit():
+        raise ValueError("В коде не указан порт")
+    port = int(port_text)
+    if not (0 < port < 65536):
+        raise ValueError("Некорректный порт в коде")
+    if not session_id:
+        raise ValueError("В коде отсутствует идентификатор сессии")
+    if not all(ch in "0123456789abcdef" for ch in session_id):
+        raise ValueError("Испорчен идентификатор сессии в коде")
+
+    targets = [(host, port)]
+    if local_ip and local_ip != host:
+        targets.append((local_ip, port))
+    return targets, session_id
 
 # Максимальный размер одного кадра TCP-протокола (защита от зависания на
 # некорректной или враждебной длине кадра)
@@ -123,18 +208,18 @@ class NetworkManager(QObject):
         self._edit_seq = 0
         self._peer_edit_seq = 0
 
-        # Прямое соединение (UDP hole punching). Объект создаём сразу, в главном
-        # потоке: Qt-сигналы из его потока приёма должны доставляться в GUI, а
+        # Прямое соединение (UDP hole punching). Объект создаётся в главном
+        # потоке при облачном подключении или при прямом соединении по коду:
+        # Qt-сигналы из его потока приёма должны доставляться в GUI, а
         # создание QObject из сетевого потока ломает эту доставку.
-        self.p2p: P2PTransport = P2PTransport(self)
-        self.p2p.connected_signal.connect(self._on_p2p_connected)
-        self.p2p.failed_signal.connect(self._on_p2p_failed)
-        self.p2p.message_received.connect(self._dispatch_message)
-        self.p2p.probe_received.connect(self._on_p2p_probe)
+        self.p2p: P2PTransport | None = None
         self.transport = "relay"          # "relay" или "p2p"
         self._p2p_accepted = False        # ответ на предложение прямого канала уже отправлен
+        # Клиент брокера: прямому соединению он не нужен, но stop() должен
+        # уметь его закрыть даже до подключения к комнате
+        self.mqtt_client: mqtt.Client | None = None
 
-        # Режимы сети: "cloud" или "tcp"
+        # Режимы сети: "cloud", "tcp" или "direct"
         self.mode: str | None = None
         self.room_code: str | None = None
 
@@ -150,8 +235,17 @@ class NetworkManager(QObject):
         self.tcp_thread: threading.Thread | None = None
         self.send_lock = threading.Lock()
 
-        # Cloud MQTT ресурсы
-        self.mqtt_client: mqtt.Client | None = None
+    def _ensure_p2p(self, session_id: str = "") -> P2PTransport:
+        """Создать (или пересоздать) транспорт прямого канала с обработчиками."""
+        if self.p2p is not None:
+            self.p2p.close()
+        self.p2p = P2PTransport(self, session_id=session_id)
+        self.p2p.connected_signal.connect(self._on_p2p_connected)
+        self.p2p.failed_signal.connect(self._on_p2p_failed)
+        self.p2p.message_received.connect(self._on_p2p_message)
+        self.p2p.probe_received.connect(self._on_p2p_probe)
+        return self.p2p
+
 
     # =========================================================================
     # РЕЖИМ 1: ОБЛАЧНЫЕ КОМНАТЫ ЧЕРЕЗ ИНТЕРНЕТ (Между любыми странами и NAT)
@@ -177,7 +271,7 @@ class NetworkManager(QObject):
         self.status_signal.emit(f"Подключение к серверу комнат... Код: {self.room_code}")
 
         connected_to_broker = False
-        for host, port, use_tls in DEFAULT_RELAY_BROKERS:
+        for host, port, use_tls in broker_order_for_room(self.room_code):
             client = None
             try:
                 # Уникальный client_id с энтропией: по одному user_id (метка времени
@@ -794,15 +888,130 @@ class NetworkManager(QObject):
         """
         Отправка сообщения в активный канал.
 
-        Если установлено прямое соединение с напарником, трафик идёт напрямую
-        (минуя посредника); иначе — через брокер или TCP.
+        В режиме прямого соединения (без посредника) трафик идёт только по
+        установленному UDP-каналу; в остальных режимах — через брокер или TCP.
         """
+        if self.mode == "direct":
+            self._send_direct(data)
+            return
         if self.p2p is not None and self.p2p.is_connected and self.p2p.send(data):
             return
         if self.mode == "cloud":
             self._cloud_send(data)
         elif self.mode == "tcp":
             self._tcp_send(data)
+
+    # =========================================================================
+    # ПРЯМОЕ СОЕДИНЕНИЕ ПО КОДУ-ПРИГЛАШЕНИЮ (совсем без посредника)
+    # =========================================================================
+
+    def create_direct_invite(self, bind_ip: str = "0.0.0.0",
+                             external_override: tuple[str, int] | None = None) -> tuple[bool, str]:
+        """
+        Подготовить прямое соединение и выдать код-приглашение.
+
+        Посредник не используется вовсе: код содержит внешний адрес этого
+        компьютера и передаётся напарнику любым удобным способом (мессенджер).
+        Возвращаем код, который нужно передать напарнику.
+
+        bind_ip и external_override нужны для проверок: два участника на одной
+        машине иначе неразличимы.
+        """
+        self.stop()
+        self.mode = "direct"
+        self.is_host = True
+        self.running = True
+
+        self.p2p = self._ensure_p2p(session_id=os.urandom(4).hex())
+
+        try:
+            self.p2p.open(bind_ip=bind_ip)
+        except Exception as e:
+            return False, f"Не удалось открыть UDP-порт: {e}"
+        if external_override and external_override[1]:
+            self.p2p.external_endpoint = (external_override[0], external_override[1])
+        elif external_override:
+            # Адрес задан, порт берём фактический (нужно для проверок)
+            self.p2p.external_endpoint = (external_override[0], self.p2p.local_port)
+        self.p2p.start_listening()
+
+        external = self.p2p.external_endpoint
+        if not external:
+            return False, ("Не удалось определить ваш внешний адрес (STUN недоступен). "
+                           "Проверьте доступ в интернет и попробуйте снова.")
+
+        host_port = external[1]
+        local = get_local_ip()
+        parts = [external[0], str(host_port), self.p2p.session_id]
+        if local and not local.startswith("127."):
+            parts.append(local)
+        code = DIRECT_CODE_PREFIX + "-".join(parts)
+        return True, code
+
+    def connect_to_invite(self, code: str, bind_ip: str = "0.0.0.0",
+                          external_override: tuple[str, int] | None = None) -> tuple[bool, str]:
+        """
+        Подключиться по коду-приглашению, который прислал напарник.
+
+        Одновременно со своим кодом-ответом сразу начинаем простукивать
+        напарника: исходящий пакет открывает проход в нашем NAT, поэтому
+        ответный пакет напарника уже доходит.
+        """
+        self.stop()
+        self.mode = "direct"
+        self.is_host = False
+        self.running = True
+
+        try:
+            targets, session_id = parse_direct_code(code)
+        except ValueError as e:
+            self.running = False
+            return False, str(e)
+
+        # Свой порт выбирается свободным: фактический адрес уходит напарнику
+        # в ответном коде, поэтому договариваться о порте заранее не нужно
+        self.p2p = self._ensure_p2p(session_id=session_id)
+
+        try:
+            self.p2p.open(bind_ip=bind_ip)
+        except Exception as e:
+            return False, f"Не удалось открыть UDP-порт: {e}"
+        if external_override:
+            self.p2p.external_endpoint = external_override
+
+        self.p2p.start_connecting(targets, timeout=DIRECT_TIMEOUT)
+        return True, self.direct_answer_code()
+
+    def direct_answer_code(self) -> str:
+        """Код-ответ: свой адрес, чтобы напарник тоже стучался к нам."""
+        code = DIRECT_CODE_PREFIX
+        parts = []
+        if self.p2p and self.p2p.external_endpoint:
+            parts.extend([self.p2p.external_endpoint[0], str(self.p2p.external_endpoint[1])])
+        parts.append(self.p2p.session_id if self.p2p else "")
+        local = get_local_ip()
+        if local and not local.startswith("127."):
+            parts.append(local)
+        return code + "-".join(parts)
+
+    def _send_direct(self, data: dict):
+        """Отправка в прямом режиме (только через установленный канал)."""
+        if self.p2p and self.p2p.is_connected:
+            if self.p2p.send(data):
+                if data.get("type") not in ("PING", "PONG"):
+                    self.bytes_out += len(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+                return True
+        return False
+
+    def _on_direct_message(self, msg: dict):
+        """Приём сообщения из прямого канала."""
+        if msg.get("sender_id") and msg.get("sender_id") == self.user_id:
+            return
+        raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+        if msg.get("type") not in ("PING", "PONG"):
+            self.bytes_in += len(raw)
+        self.is_connected = True
+        self._dispatch_message(msg)
 
     # =========================================================================
     # ПРЯМОЕ СОЕДИНЕНИЕ (P2P)
@@ -816,6 +1025,8 @@ class NetworkManager(QObject):
         единственное, для чего нужен посредник. Дальше стороны одновременно
         простукивают друг друга, открывая соответствия в своих NAT.
         """
+        if self.p2p is None:
+            self.p2p = self._ensure_p2p()
         if self.p2p.is_connected:
             return
         try:
@@ -835,8 +1046,23 @@ class NetworkManager(QObject):
     def _on_p2p_connected(self, endpoint: str):
         """Прямой канал подтверждён: переключаемся на него."""
         self.transport = "p2p"
+        # Канал установлен — соединение активно даже до первого сообщения,
+        # иначе интерфейс показывал бы «нет связи» при живом канале
+        self.is_connected = True
         self.status_signal.emit(f"⚡ Прямое соединение с напарником: {endpoint}")
         self.transport_changed.emit(endpoint, "p2p")
+
+        # В прямом режиме посредника нет, поэтому знакомиться нужно самим:
+        # сразу представляемся, чтобы напарник увидел имя и цвет
+        if self.mode == "direct":
+            self.is_connected = True
+            self._send_direct({
+                "type": "JOIN",
+                "sender_id": self.user_id,
+                "name": self.username,
+                "color": self.user_color,
+                "is_creator": self.is_host,
+            })
 
     def _on_p2p_failed(self, reason: str):
         """Прямой канал не сложился — остаёмся на брокере, связь не теряется."""
@@ -846,9 +1072,23 @@ class NetworkManager(QObject):
 
     def _on_p2p_probe(self, addr: str, port: int):
         """От напарника пришёл пакет: запоминаем его адрес и начинаем простукивание."""
-        if self.p2p.is_connected:
+        if self.p2p is None or self.p2p.is_connected:
             return
         self.p2p.start_connecting([(addr, port)], timeout=6.0)
+
+    def _on_p2p_message(self, msg: dict):
+        """
+        Сообщение из прямого канала в облачном режиме.
+
+        Отсекаем собственное эхо: брокер при подтверждённой доставке может
+        вернуть отправленное сообщение автору.
+        """
+        if msg.get("sender_id") and msg.get("sender_id") == self.user_id:
+            return
+        raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+        if msg.get("type") not in ("PING", "PONG"):
+            self.bytes_in += len(raw)
+        self._dispatch_message(msg)
 
     def _handle_p2p_hello(self, msg: dict):
         """
@@ -1047,47 +1287,46 @@ class NetworkManager(QObject):
         self._broadcast({"type": "STDIN_INPUT", "text": text})
 
     def stop(self):
-        """Закрытие всех соединений."""
+        """
+        Закрытие всех соединений.
+
+        Метод вызывается и до первого подключения (например, при подготовке
+        прямого соединения), поэтому к необязательным ресурсам обращаемся
+        через getattr: у свежего объекта их ещё нет.
+        """
         self.running = False
         self.is_connected = False
         self.initial_joined = False
         self.transport = "relay"
 
         # Закрываем прямой канал: сокет и поток приёма
-        try:
-            self.p2p.close()
-        except Exception:
-            pass
+        p2p = getattr(self, "p2p", None)
+        if p2p is not None:
+            try:
+                p2p.close()
+            except Exception:
+                pass
 
-        if self.mqtt_client:
+        client = getattr(self, "mqtt_client", None)
+        if client:
             try:
                 # Оповещаем об уходе
                 if self.room_code:
                     self._cloud_send({"type": "LEAVE", "name": self.username})
-                self.mqtt_client.loop_stop()
-                self.mqtt_client.disconnect()
+                client.loop_stop()
+                client.disconnect()
             except Exception:
                 pass
             self.mqtt_client = None
 
-        if self.peer_socket:
+        for attr in ("peer_socket", "server_socket", "client_socket"):
+            sock = getattr(self, attr, None)
+            if sock is None:
+                continue
             try:
-                self.peer_socket.shutdown(socket.SHUT_RDWR)
-                self.peer_socket.close()
+                if attr == "peer_socket":
+                    sock.shutdown(socket.SHUT_RDWR)
+                sock.close()
             except Exception:
                 pass
-            self.peer_socket = None
-
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
-            self.server_socket = None
-
-        if self.client_socket:
-            try:
-                self.client_socket.close()
-            except Exception:
-                pass
-            self.client_socket = None
+            setattr(self, attr, None)
