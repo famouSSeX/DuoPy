@@ -1521,11 +1521,12 @@ class TestDirectWithoutBroker(unittest.TestCase):
         self.addCleanup(guest.stop)
 
         ok, code = host.create_direct_invite(bind_ip="127.0.0.1",
-                                             external_override=("127.0.0.1", None))
+                                             external_override=("127.0.0.1", None),
+                                             port=0)
         self.assertTrue(ok, f"код-приглашение должен создаться: {code}")
         self.assertTrue(code.startswith("DP1-"), code)
 
-        ok2, _answer = guest.connect_to_invite(code, bind_ip="127.0.0.2")
+        ok2, _answer = guest.connect_to_invite(code, bind_ip="127.0.0.2", port=0)
         self.assertTrue(ok2, "подключение по коду должно начаться")
 
         for _ in range(int(timeout * 20)):
