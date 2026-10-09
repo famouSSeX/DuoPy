@@ -38,7 +38,10 @@ STUN_MAGIC_COOKIE = 0x2112A442
 STUN_BINDING_REQUEST = 0x0001
 STUN_BINDING_RESPONSE = 0x0101
 
-# Пакет-«простукивание»: открывает соответствие в NAT и подтверждает канал
+# Пакет-«простукивание»: открывает соответствие в NAT и подтверждает канал.
+# К приставке добавляется идентификатор сессии, чтобы чужой пакет не был
+# принят за напарника.
+PROBE_PREFIX = b"DUOPYP2P:"
 PROBE_INTERVAL = 0.6
 PEER_TIMEOUT = 6.0
 
@@ -139,9 +142,12 @@ class P2PTransport(QObject):
     message_received = pyqtSignal(dict)    # разобранное сообщение
     probe_received = pyqtSignal(str, int)  # (адрес отправителя, порт) — для обмена адресами
 
-    def __init__(self, parent=None, own_ips=None):
+    def __init__(self, parent=None, own_ips=None, session_id: str = ""):
         super().__init__(parent)
         self.sock: socket.socket | None = None
+        # Идентификатор сессии: попадает в простукивание, поэтому чужой
+        # участник (или клиент из другой сессии) не будет принят за напарника.
+        self.session_id = session_id or os.urandom(4).hex()
         # Адреса, которые считаются «своими». По умолчанию определяются
         # автоматически; в тестах можно задать явно.
         self.own_ips = set(own_ips) if own_ips else None
@@ -163,9 +169,13 @@ class P2PTransport(QObject):
 
     # ------------------------------------------------------------------ запуск
 
-    def open(self, bind_ip: str = "0.0.0.0") -> int:
+    def open(self, bind_ip: str = "0.0.0.0", preferred_port: int = 0) -> int:
         """
         Открыть UDP-сокет и узнать свой внешний адрес.
+
+        preferred_port нужен для прямого соединения по коду-приглашению: порт
+        указывается в коде, поэтому он должен быть предсказуемым. Если порт
+        занят, берём свободный — код всё равно содержит фактический адрес.
 
         bind_ip нужен для тестов: два процесса на одной машине удобно
         разводить по разным loopback-адресам, иначе они выглядят как один узел.
@@ -173,7 +183,11 @@ class P2PTransport(QObject):
         if self.sock:
             return self.local_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((bind_ip, 0))
+        try:
+            self.sock.bind((bind_ip, preferred_port))
+        except OSError:
+            # Порт занят (например, уже запущена вторая копия) — берём любой
+            self.sock.bind((bind_ip, 0))
         self.local_port = self.sock.getsockname()[1]
         self.sock.settimeout(0.2)
         # Свой адрес учитываем при проверке «это наш же пакет»
@@ -277,7 +291,7 @@ class P2PTransport(QObject):
             time.sleep(0.1)
 
     def _send_probe(self):
-        payload = b"DUOPYP2P"
+        payload = self._probe_payload()
         with self._lock:
             targets = list(getattr(self, "_probe_targets", []))
             if self.peer_sockaddr:
@@ -293,6 +307,10 @@ class P2PTransport(QObject):
                 continue
             except Exception:
                 continue
+
+    def _probe_payload(self) -> bytes:
+        """Пакет простукивания: приставка и идентификатор сессии."""
+        return PROBE_PREFIX + self.session_id.encode("ascii", "ignore")
 
     # ------------------------------------------------------------------ приём
 
@@ -318,8 +336,15 @@ class P2PTransport(QObject):
                 print(f"[DuoPy] Ошибка приёма прямого канала: {e}")
                 continue
 
-            if data.startswith(b"DUOPYP2P"):
-                self._handle_probe(addr)
+            # Собственные пакеты отбрасываем сразу: и простукивания, и данные.
+            # Раньше проверка стояла только в обработчике простукиваний, из-за
+            # чего любое собственное эхо (например, широковещательный запрос)
+            # принималось за напарника и канал «устанавливался» сам с собой.
+            if self._is_own_packet(addr):
+                continue
+
+            if data.startswith(PROBE_PREFIX):
+                self._handle_probe(addr, data[len(PROBE_PREFIX):].decode("ascii", "ignore"))
                 continue
 
             self._last_peer_packet = time.time()
@@ -346,19 +371,19 @@ class P2PTransport(QObject):
 
     def _is_own_packet(self, addr) -> bool:
         """
-        Наш ли это пакет (эхо широковещательного запроса).
+        Наш ли это пакет (эхо собственного запроса).
 
-        Без этой проверки клиент «подключался» к самому себе: широковещательный
-        поиск возвращался на свой же сокет, и канал считался установленным.
-        Порт проверяем всегда: пакет с нашего порта — гарантированно наше эхо.
+        Два признака: порт отправителя совпадает с нашим портом, либо адрес
+        отправителя равен адресу, к которому привязан наш сокет. В обычной
+        работе сокет слушает 0.0.0.0, поэтому второй признак не срабатывает, а
+        при явной привязке к адресу (проверки на одной машине) он отсекает
+        собственное эхо.
         """
         if addr[1] == self.local_port:
             return True
-        if addr[0] == self.bind_ip and self.bind_ip != "0.0.0.0":
-            return True
-        return addr[0] in self._own_addresses()
+        return bool(self.bind_ip and self.bind_ip != "0.0.0.0" and addr[0] == self.bind_ip)
 
-    def _handle_probe(self, addr):
+    def _handle_probe(self, addr, session_id: str = ""):
         """
         Простукивание: запоминаем адрес напарника и отвечаем.
 
@@ -366,7 +391,12 @@ class P2PTransport(QObject):
         именно на том порту, который он открыл для приёма. Отправка по
         исходному адресу (с портом отправителя) уходила обратно на свой же
         сокет, и канал оставался без данных.
+
+        Идентификатор сессии отсекает чужие пакеты: без него за напарника
+        можно принять постороннего, который просто угадал порт.
         """
+        if session_id and session_id != self.session_id:
+            return
         if self._is_own_packet(addr):
             return
         self._last_peer_packet = time.time()
@@ -377,7 +407,7 @@ class P2PTransport(QObject):
         if not was_connected:
             self._mark_connected(addr)
             try:
-                self.sock.sendto(b"DUOPYP2P", (addr[0], self.local_port))
+                self.sock.sendto(self._probe_payload(), (addr[0], self.local_port))
             except Exception:
                 pass
         self.probe_received.emit(addr[0], addr[1])
